@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+deploy/.env.prod
+deploy/certs/*
+!deploy/certs/.gitkeep
+deploy/nginx/tls/runtime/*
+!deploy/nginx/tls/runtime/.gitkeep
