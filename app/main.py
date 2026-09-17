@@ -3,11 +3,15 @@ import re
 from time import perf_counter
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import db
+from app.api import accounts, auth
 from app.config import settings
+from app.errors import APIError
 from app.logging_config import configure_logging
 
 configure_logging()
@@ -15,6 +19,49 @@ logger = logging.getLogger(__name__)
 request_id_pattern = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
+app.include_router(auth.router)
+app.include_router(accounts.router)
+
+
+def error_response(
+    request: Request, status_code: int, code: str, message: str, details=None
+):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "code": code,
+            "message": message,
+            "details": jsonable_encoder(details),
+            "request_id": getattr(request.state, "request_id", None),
+        },
+    )
+
+
+@app.exception_handler(APIError)
+def api_error_handler(request: Request, exc: APIError):
+    return error_response(request, exc.status_code, exc.code, exc.message, exc.details)
+
+
+@app.exception_handler(RequestValidationError)
+def validation_error_handler(request: Request, exc: RequestValidationError):
+    details = [
+        {key: value for key, value in error.items() if key != "input"}
+        for error in exc.errors()
+    ]
+    return error_response(
+        request, 422, "VALIDATION_ERROR", "Request validation failed", details
+    )
+
+
+@app.exception_handler(HTTPException)
+def http_error_handler(request: Request, exc: HTTPException):
+    return error_response(request, exc.status_code, "HTTP_ERROR", str(exc.detail))
+
+
+@app.exception_handler(Exception)
+def unhandled_error_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled application error", exc_info=exc)
+    return error_response(request, 500, "INTERNAL_ERROR", "An unexpected error occurred")
 
 
 @app.middleware("http")

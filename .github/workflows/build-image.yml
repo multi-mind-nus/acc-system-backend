@@ -43,6 +43,33 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: acc_test
+          POSTGRES_USER: acc
+          POSTGRES_PASSWORD: acc_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U acc -d acc_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      redis:
+        image: redis:8.2.1-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+psycopg://acc:acc_test@localhost:5432/acc_test
+      REDIS_URL: redis://localhost:6379/15
+      JWT_SECRET: test-only-secret-with-at-least-32-characters
+      FRONTEND_ORIGIN: http://localhost
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.1.0
@@ -52,6 +79,7 @@ jobs:
       - name: Test
         run: |
           uv sync --frozen
+          uv run alembic upgrade head
           uv run pytest
       - name: Build
         run: docker build --build-arg APP_VERSION="$GITHUB_SHA" --tag acc-system-backend:test .

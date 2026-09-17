@@ -38,15 +38,22 @@ docker build -t acc-system-nginx:local nginx
 docker build --build-arg APP_VERSION=local -t acc-system-frontend:local ../../acc-system-frontend
 cp .env.example .env.prod
 docker compose --env-file .env.prod -f compose.yml up -d
+docker compose --env-file .env.prod -f compose.yml --profile tools run --rm bootstrap
 ```
 
-Run commands from the `deploy/` directory. For production, replace the three local image values with immutable ECR SHA tags and replace all example passwords.
+Run commands from the `deploy/` directory. Set `JWT_SECRET` to a random value (for example, `openssl rand -hex 32`) and set the bootstrap administrator fields before the first bootstrap run. For production, replace the three local image values with immutable ECR SHA tags and replace all example passwords.
 
-## Optional TLS
+Set `FRONTEND_ORIGIN` to the exact browser origin, including the scheme and any non-default port. `http://localhost` is for local acceptance only; visiting through a different host without changing this value prevents refresh and logout.
+
+The backend is reachable only on the Compose network and trusts the forwarding headers that Nginx overwrites with the actual connection address. Do not publish the backend port or attach untrusted containers to this network. If another proxy is added in front of Nginx, configure its trusted addresses explicitly before relying on client-IP rate limits.
+
+## TLS (required for public production)
 
 1. Put `fullchain.pem` and `privkey.pem` in `deploy/certs/`.
 2. Copy `nginx/tls/https.conf.example` to `nginx/tls/runtime/https.conf` and set the domain.
-3. Start with both Compose files:
+3. Set `FRONTEND_ORIGIN=https://your-domain` and `COOKIE_SECURE=true` in `.env.prod`. Use `COOKIE_SECURE=false` only for local or restricted HTTP acceptance.
+4. Block public HTTP access or redirect it to HTTPS at the entry point; the base HTTP listener is retained for local acceptance and health checks.
+5. Start with both Compose files:
 
 ```bash
 docker compose --env-file .env.prod -f compose.yml -f compose.tls.yml up -d
@@ -57,6 +64,8 @@ Certificate renewal is owned by the server or an external load balancer; private
 ## Release
 
 Run these commands on the server from `/opt/acc-system` after refreshing its ECR login:
+
+For a TLS deployment, include `-f compose.tls.yml` after `-f compose.yml` in every command below; omitting it from `up` would remove the HTTPS port and certificate mounts.
 
 ```bash
 docker compose --env-file .env.prod -f compose.yml pull

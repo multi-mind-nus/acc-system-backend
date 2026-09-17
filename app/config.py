@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +13,25 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://acc:acc@localhost:5432/acc"
     redis_url: str = "redis://localhost:6379/0"
     worker_poll_seconds: float = 10.0
+    jwt_secret: SecretStr = SecretStr("local-development-only-change-me")
+    jwt_issuer: str = "acc-system"
+    jwt_audience: str = "acc-system-web"
+    access_token_minutes: int = 15
+    refresh_token_days: int = 7
+    cookie_secure: bool = False
+    frontend_origin: str = "http://localhost"
+    login_rate_limit: int = 10
+    token_rate_limit: int = 10
+    rate_limit_window_seconds: int = 60
+
+    @model_validator(mode="after")
+    def require_production_secrets(self):
+        if (
+            self.environment == "production"
+            and self.jwt_secret.get_secret_value() == "local-development-only-change-me"
+        ):
+            raise ValueError("JWT_SECRET must be set in production")
+        return self
 
 
 @lru_cache

@@ -5,6 +5,11 @@ x-backend-environment: &backend-environment
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
   REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
   WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-10}
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+  JWT_ISSUER: ${JWT_ISSUER:-acc-system}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-acc-system-web}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost}
 
 services:
   postgres:
@@ -52,7 +57,10 @@ services:
 
   backend:
     image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      # Backend has no public port; Nginx overwrites incoming forwarding headers.
+      FORWARDED_ALLOW_IPS: "*"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -68,6 +76,22 @@ services:
     volumes:
       - documents:/data/documents
       - quarantine:/data/quarantine
+    networks:
+      - internal
+
+  bootstrap:
+    image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+    profiles: ["tools"]
+    command: ["python", "-m", "app.cli", "bootstrap-admin"]
+    environment:
+      <<: *backend-environment
+      BOOTSTRAP_FIRM_NAME: ${BOOTSTRAP_FIRM_NAME:-Local Accounting}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Local Admin}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@local.test}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     networks:
       - internal
 
