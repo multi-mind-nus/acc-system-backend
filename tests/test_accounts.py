@@ -12,7 +12,10 @@ from app.auth import decode_token, hash_password, hash_token
 from app.config import settings
 from app.db import SessionLocal, redis_client
 from app.main import app
-from app.models import Base, Client, Firm, FirmMember, PasswordResetToken, User, UserInvite
+from app.models import (
+    Base, Client, ClientBankAccount, Firm, FirmMember,
+    PasswordResetToken, User, UserInvite,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -385,3 +388,265 @@ def test_logout_does_not_report_success_when_revocation_fails(admin: User, monke
         assert response.status_code == 503
         assert response.json()["code"] == "AUTH_UNAVAILABLE"
         assert "set-cookie" not in response.headers
+
+
+def test_f3_staff_filters_client_pagination_and_validation(admin: User) -> None:
+    with SessionLocal.begin() as db:
+        for number in range(3):
+            staff = User(
+                firm_id=admin.firm_id, email=f"staff{number}@example.com",
+                name=f"Staff {number}", password_hash=admin.password_hash,
+                status="DISABLED" if number == 2 else "ACTIVE",
+            )
+            db.add(staff)
+            db.flush()
+            db.add(FirmMember(
+                firm_id=admin.firm_id, user_id=staff.id,
+                role="FIRM_ADMIN" if number == 2 else "ACCOUNTANT",
+            ))
+        db.add(User(firm_id=admin.firm_id, email="contact@example.com", name="Contact",
+                    password_hash=admin.password_hash))
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        staff = client.get("/api/v1/users", headers=headers, params={
+            "staff_only": True, "role": "ACCOUNTANT", "status": "ACTIVE",
+            "search": "STAFF", "page_size": 1,
+        }).json()
+        assert staff["total"] == 2 and staff["page_size"] == 1
+        assert staff["items"][0]["email"] == "staff0@example.com"
+        assert client.get("/api/v1/users", headers=headers, params={
+            "staff_only": True, "role": "ACCOUNTANT", "status": "ACTIVE",
+            "search": "STAFF", "page_size": 1, "page": 2,
+        }).json()["items"][0]["email"] == "staff1@example.com"
+        assert client.get("/api/v1/users", headers=headers).json()["total"] == 5
+        # A disabled admin cannot replace the last active admin, but its own role
+        # can still be changed without affecting the active-admin invariant.
+        assert client.patch(f"/api/v1/users/{admin.id}", headers=headers, json={
+            "role": "ACCOUNTANT",
+        }).json()["code"] == "LAST_ADMIN_REQUIRED"
+        disabled = client.get("/api/v1/users?role=FIRM_ADMIN&status=DISABLED", headers=headers).json()["items"][0]
+        assert client.patch(f"/api/v1/users/{disabled['id']}", headers=headers, json={
+            "role": "ACCOUNTANT",
+        }).status_code == 200
+        for code in ("ZULU", "ALPHA"):
+            response = client.post("/api/v1/clients", headers=headers, json={
+                "code": code, "legal_name": code,
+            })
+            assert response.status_code == 201
+        page = client.get("/api/v1/clients?page_size=1", headers=headers).json()
+        assert page["total"] == 2 and page["items"][0]["code"] == "ALPHA"
+        client_id = page["items"][0]["id"]
+        assert client.patch(f"/api/v1/clients/{client_id}", headers=headers, json={
+            "status": "DISABLED", "features": {"has_loan": True},
+        }).json()["features"]["has_loan"] is True
+        assert client.get("/api/v1/clients?status=DISABLED&search=alpha", headers=headers).json()["total"] == 1
+        duplicate = client.post("/api/v1/clients", headers=headers, json={"code": "alpha", "legal_name": "Other"})
+        assert duplicate.status_code == 409 and duplicate.json()["code"] == "CLIENT_CODE_EXISTS"
+        for payload in ({"legal_name": None}, {"legal_name": "   "}, {"base_currency": "sgd"}):
+            invalid = client.patch(f"/api/v1/clients/{client_id}", headers=headers, json=payload)
+            assert invalid.status_code == 422 and invalid.json()["request_id"]
+        assert client.get("/api/v1/users?status=INVALID", headers=headers).status_code == 422
+        assert client.get("/api/v1/clients?page=0", headers=headers).status_code == 422
+
+
+def test_f3_banks_assignments_and_tenant_boundaries(admin: User) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    with SessionLocal.begin() as db:
+        accountant = User(firm_id=admin.firm_id, email="accountant@example.com", name="Accountant",
+                          password_hash=admin.password_hash)
+        db.add(accountant)
+        db.flush()
+        db.add(FirmMember(firm_id=admin.firm_id, user_id=accountant.id, role="ACCOUNTANT"))
+        other_firm = Firm(name="Other firm")
+        db.add(other_firm)
+        db.flush()
+        foreign_client = Client(firm_id=other_firm.id, code="FOREIGN", legal_name="Foreign")
+        db.add(foreign_client)
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        client_id = client.post("/api/v1/clients", headers=headers, json={
+            "code": "BANKS", "legal_name": "Bank client",
+        }).json()["id"]
+        other_id = client.post("/api/v1/clients", headers=headers, json={
+            "code": "OTHER", "legal_name": "Other client",
+        }).json()["id"]
+        staff_headers = bearer(login(client, accountant.email, "correct horse battery staple"))
+        bank_url = f"/api/v1/clients/{client_id}/bank-accounts"
+        assignment_url = f"/api/v1/clients/{client_id}/assignments"
+        assert client.get(bank_url, headers=staff_headers).status_code == 404
+        assert client.get(assignment_url, headers=staff_headers).status_code == 404
+        assert client.put(assignment_url, headers=headers, json={"user_ids": [str(accountant.id)]}).status_code == 200
+        assert client.get(assignment_url, headers=staff_headers).json() == {"user_ids": [str(accountant.id)]}
+        bank_payload = {"bank": "DBS", "account_last4": "0042", "currency": "SGD"}
+        bank = client.post(bank_url, headers=headers, json=bank_payload)
+        assert bank.status_code == 201 and bank.json()["account_last4"] == "0042"
+        bank_id = bank.json()["id"]
+        assert client.get(bank_url, headers=staff_headers).json() == [bank.json()]
+        assert client.post(bank_url, headers=staff_headers, json=bank_payload).status_code == 403
+        assert client.patch(f"{bank_url}/{bank_id}", headers=staff_headers, json={"bank": "UOB"}).status_code == 403
+        assert client.patch(f"{bank_url}/{bank_id}", headers=headers, json={"status": "DISABLED"}).json()["status"] == "DISABLED"
+        for field, value in (("bank", " "), ("account_last4", "12345"), ("currency", "sgd")):
+            assert client.post(bank_url, headers=headers, json={**bank_payload, field: value}).status_code == 422
+        assert client.patch(f"{bank_url}/{bank_id}", headers=headers, json={"bank": None}).status_code == 422
+        assert client.patch(f"/api/v1/clients/{other_id}/bank-accounts/{bank_id}", headers=headers,
+                            json={"bank": "Wrong client"}).status_code == 404
+        for method in ("get", "post"):
+            response = getattr(client, method)(
+                f"/api/v1/clients/{foreign_client.id}/bank-accounts", headers=headers,
+                **({"json": bank_payload} if method == "post" else {}),
+            )
+            assert response.status_code == 404
+        assert client.put(assignment_url, headers=headers, json={"user_ids": [str(admin.id)]}).status_code == 422
+        assert client.put(assignment_url, headers=headers, json={"user_ids": []}).status_code == 200
+        assert client.get(bank_url, headers=staff_headers).status_code == 404
+        # Tenant isolation is also enforced by the composite foreign key.
+        with pytest.raises(IntegrityError), SessionLocal.begin() as db:
+            db.add(ClientBankAccount(firm_id=admin.firm_id, client_id=foreign_client.id, **bank_payload))
+            db.flush()
+
+
+def test_f3_invitation_management_lifecycle(admin: User) -> None:
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        url = "/api/v1/users/invitations"
+        original = client.post(url, headers=headers, json={
+            "email": "new-staff@example.com", "role": "ACCOUNTANT",
+        }).json()
+        listing = client.get(url, headers=headers).json()
+        assert listing["total"] == 1 and listing["items"][0]["status"] == "PENDING"
+        assert set(listing["items"][0]) == {"id", "email", "role", "expires_at", "created_at", "status"}
+        resent = client.post(f"{url}/{original['id']}/resend", headers=headers)
+        assert resent.status_code == 200
+        assert resent.json()["id"] != original["id"]
+        accept = {"name": "New staff", "password": "a sufficiently long password", "token": original["token"]}
+        assert client.post("/api/v1/auth/invitations/accept", json=accept).status_code == 400
+        statuses = {item["id"]: item["status"] for item in client.get(url, headers=headers).json()["items"]}
+        assert statuses == {original["id"]: "REVOKED", resent.json()["id"]: "PENDING"}
+        assert client.post("/api/v1/auth/invitations/accept", json={**accept, "token": resent.json()["token"]}).status_code == 200
+        for action in ("revoke", "resend"):
+            conflict = client.post(f"{url}/{resent.json()['id']}/{action}", headers=headers)
+            assert conflict.status_code == 409
+            assert conflict.json()["code"] == "INVITATION_ALREADY_ACCEPTED"
+        expiring = client.post(url, headers=headers, json={"email": "expired-new@example.com", "role": "ACCOUNTANT"}).json()
+        with SessionLocal.begin() as db:
+            db.get(UserInvite, UUID(expiring["id"])).expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        statuses = {item["id"]: item["status"] for item in client.get(url, headers=headers).json()["items"]}
+        assert statuses[expiring["id"]] == "EXPIRED" and statuses[resent.json()["id"]] == "ACCEPTED"
+        assert client.get(f"{url}?page=2&page_size=1", headers=headers).json()["total"] == 3
+        replacement = client.post(f"{url}/{expiring['id']}/resend", headers=headers).json()
+        assert client.post(f"{url}/{replacement['id']}/revoke", headers=headers).status_code == 200
+        assert client.post(f"{url}/{replacement['id']}/revoke", headers=headers).status_code == 200
+        assert client.post("/api/v1/auth/invitations/accept", json={**accept, "token": replacement["token"]}).status_code == 400
+        staff_headers = bearer(login(client, "new-staff@example.com", accept["password"]))
+        assert client.get(url, headers=staff_headers).status_code == 403
+        assert client.post(f"{url}/{original['id']}/resend", headers=staff_headers).status_code == 403
+
+
+def test_f3_client_contact_permissions_last_admin_and_invitation_scope(admin: User) -> None:
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        client_id = client.post("/api/v1/clients", headers=headers, json={
+            "code": "CONTACTS", "legal_name": "Contacts client",
+        }).json()["id"]
+        other_id = client.post("/api/v1/clients", headers=headers, json={
+            "code": "OTHER", "legal_name": "Other client",
+        }).json()["id"]
+        prefix = f"/api/v1/clients/{client_id}"
+        contacts = []
+        for name, role in (("manager", "CLIENT_ADMIN"), ("submitter", "CLIENT_SUBMITTER")):
+            invite = client.post(f"{prefix}/invitations", headers=headers, json={
+                "email": f"{name}@example.com", "role": role,
+            }).json()
+            assert client.post("/api/v1/auth/invitations/accept", json={
+                "token": invite["token"], "name": name, "password": "contact secure password",
+            }).status_code == 200
+            contacts.append(login(client, f"{name}@example.com", "contact secure password"))
+        manager, submitter = contacts
+        manager_headers, submitter_headers = bearer(manager), bearer(submitter)
+        for method, suffix, kwargs in (
+            ("get", "/invitations", {}),
+            ("post", "/invitations", {"json": {"email": "blocked@example.com", "role": "CLIENT_ADMIN"}}),
+            ("patch", f"/members/{submitter['user']['id']}", {"json": {"role": "CLIENT_ADMIN"}}),
+        ):
+            assert getattr(client, method)(f"{prefix}{suffix}", headers=submitter_headers, **kwargs).status_code == 404
+        assert client.get(f"{prefix}/assignments", headers=manager_headers).status_code == 403
+        for payload in ({"role": "CLIENT_SUBMITTER"}, {"role": "CLIENT_ADMIN", "active": False}):
+            denied = client.patch(f"{prefix}/members/{manager['user']['id']}", headers=manager_headers, json=payload)
+            assert denied.status_code == 409 and denied.json()["code"] == "LAST_CLIENT_ADMIN_REQUIRED"
+        invite = client.post(f"{prefix}/invitations", headers=manager_headers, json={
+            "email": "pending-contact@example.com", "role": "CLIENT_SUBMITTER",
+        }).json()
+        assert client.get(f"{prefix}/invitations", headers=manager_headers).json()["total"] == 3
+        assert client.post(f"/api/v1/users/invitations/{invite['id']}/revoke", headers=headers).status_code == 404
+        assert client.post(f"/api/v1/clients/{other_id}/invitations/{invite['id']}/revoke", headers=headers).status_code == 404
+        assert client.post(f"{prefix}/invitations/{invite['id']}/resend", headers=submitter_headers).status_code == 404
+        assert client.post(f"{prefix}/invitations/{invite['id']}/revoke", headers=manager_headers).status_code == 200
+        assert client.patch(f"{prefix}/members/{submitter['user']['id']}", headers=manager_headers,
+                            json={"role": "CLIENT_ADMIN"}).status_code == 200
+        assert client.patch(f"{prefix}/members/{manager['user']['id']}", headers=manager_headers,
+                            json={"role": "CLIENT_ADMIN", "active": False}).status_code == 200
+        assert client.get(f"{prefix}/members", headers=manager_headers).status_code == 403
+
+
+@pytest.mark.parametrize("disabled", ["firm", "client", "user"])
+def test_f3_invitation_rejects_disabled_entities(admin: User, disabled: str) -> None:
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        client_id = client.post("/api/v1/clients", headers=headers, json={
+            "code": "DISABLED", "legal_name": "Disabled client",
+        }).json()["id"]
+        invite = client.post(f"/api/v1/clients/{client_id}/invitations", headers=headers, json={
+            "email": "disabled@example.com", "role": "CLIENT_ADMIN",
+        }).json()
+        with SessionLocal.begin() as db:
+            if disabled == "firm":
+                db.get(Firm, admin.firm_id).status = "DISABLED"
+            elif disabled == "client":
+                db.get(Client, UUID(client_id)).status = "DISABLED"
+            else:
+                db.add(User(firm_id=admin.firm_id, email="disabled@example.com", name="Disabled",
+                            password_hash=admin.password_hash, status="DISABLED"))
+        assert client.post("/api/v1/auth/invitations/accept", json={
+            "token": invite["token"], "name": "Disabled", "password": "correct horse battery staple",
+        }).status_code == 400
+        if disabled == "client":
+            assert client.post(f"/api/v1/clients/{client_id}/invitations/{invite['id']}/resend", headers=headers).status_code == 409
+        elif disabled == "user":
+            assert client.post(f"/api/v1/clients/{client_id}/invitations", headers=headers, json={
+                "email": "disabled@example.com", "role": "CLIENT_ADMIN",
+            }).status_code == 409
+
+
+@pytest.mark.parametrize("action", ["revoke", "resend"])
+def test_f3_invitation_accept_and_management_are_atomic(admin: User, action: str) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        invite = client.post("/api/v1/users/invitations", headers=headers, json={
+            "email": "race@example.com", "role": "ACCOUNTANT",
+        }).json()
+    barrier = Barrier(2)
+
+    def accept():
+        with TestClient(app) as client:
+            barrier.wait(timeout=5)
+            return client.post("/api/v1/auth/invitations/accept", json={
+                "token": invite["token"], "name": "Race", "password": "race secure password",
+            })
+
+    def manage():
+        with TestClient(app) as client:
+            barrier.wait(timeout=5)
+            return client.post(f"/api/v1/users/invitations/{invite['id']}/{action}", headers=headers)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        acceptance = pool.submit(accept)
+        management = pool.submit(manage)
+        accepted, managed = acceptance.result(timeout=10), management.result(timeout=10)
+    assert (accepted.status_code, managed.status_code) in ((200, 409), (400, 200))
+    with SessionLocal() as db:
+        stored = db.get(UserInvite, UUID(invite["id"]))
+        assert bool(stored.accepted_at) != bool(stored.revoked_at)

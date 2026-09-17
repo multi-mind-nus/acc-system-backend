@@ -12,6 +12,7 @@ from app.auth import (
     hash_password,
     hash_token,
     load_principal,
+    lock_firm,
     normalize_email,
     opaque_token,
     revoke_session,
@@ -25,6 +26,7 @@ from app.db import DbSession
 from app.errors import APIError
 from app.models import (
     AuditEvent,
+    Client,
     ClientMember,
     FirmMember,
     PasswordResetToken,
@@ -198,12 +200,23 @@ def accept_invitation(
 ) -> MessageResponse:
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit("invite", client_ip, settings.token_rate_limit)
-    now = datetime.now(UTC)
+    invite = db.scalar(select(UserInvite).where(UserInvite.token_hash == hash_token(payload.token)))
+    if invite is None:
+        raise APIError(400, "INVITATION_INVALID", "Invitation is invalid or expired")
+    firm = lock_firm(db, invite.firm_id)
+    if firm is None or firm.status != "ACTIVE":
+        raise APIError(400, "INVITATION_INVALID", "Invitation cannot be accepted")
+    if invite.client_id is not None:
+        client = db.scalar(select(Client).where(
+            Client.id == invite.client_id, Client.firm_id == invite.firm_id,
+        ).with_for_update())
+        if client is None or client.status != "ACTIVE":
+            raise APIError(400, "INVITATION_INVALID", "Invitation cannot be accepted")
     invite = db.scalar(
-        select(UserInvite)
-        .where(UserInvite.token_hash == hash_token(payload.token))
-        .with_for_update()
+        select(UserInvite).where(UserInvite.id == invite.id).with_for_update()
+        .execution_options(populate_existing=True)
     )
+    now = datetime.now(UTC)
     if (
         invite is None
         or invite.accepted_at is not None
@@ -216,7 +229,7 @@ def accept_invitation(
         select(User).where(func.lower(User.email) == normalize_email(invite.email))
     )
     if user:
-        if user.firm_id != invite.firm_id or not verify_password(
+        if user.status != "ACTIVE" or user.firm_id != invite.firm_id or not verify_password(
             payload.password, user.password_hash
         ):
             raise APIError(400, "INVITATION_INVALID", "Invitation cannot be accepted")

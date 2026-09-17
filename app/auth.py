@@ -338,6 +338,15 @@ def require_firm_role(*roles: str):
     return dependency
 
 
+def lock_firm(db: Session, firm_id: UUID) -> Firm | None:
+    # ponytail: serialize low-volume membership/invitation changes per firm;
+    # replace with finer-grained locks only if admin write contention matters.
+    return db.scalar(
+        select(Firm).where(Firm.id == firm_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
 def ensure_client_access(
     db: Session,
     principal: Principal,

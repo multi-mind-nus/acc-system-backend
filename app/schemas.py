@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 FirmRole = Literal["FIRM_ADMIN", "ACCOUNTANT"]
 ClientRole = Literal["CLIENT_ADMIN", "CLIENT_SUBMITTER"]
@@ -49,7 +49,7 @@ class ChangePasswordRequest(BaseModel):
 
 class InvitationAcceptRequest(BaseModel):
     token: str = Field(min_length=32, max_length=512)
-    name: str = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=200, pattern=r"\S")
     password: str = Field(min_length=12, max_length=128)
 
 
@@ -89,8 +89,24 @@ class InvitationOut(BaseModel):
     token: str
 
 
+class InvitationListItem(BaseModel):
+    id: UUID
+    email: EmailStr
+    role: str
+    expires_at: datetime
+    created_at: datetime
+    status: Literal["PENDING", "ACCEPTED", "EXPIRED", "REVOKED"]
+
+
+class InvitationListOut(BaseModel):
+    items: list[InvitationListItem]
+    total: int
+    page: int
+    page_size: int
+
+
 class UserUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=200)
+    name: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"\S")
     status: UserStatus | None = None
     role: FirmRole | None = None
 
@@ -124,6 +140,8 @@ class ClientFeatures(BaseModel):
 
 
 class ClientCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     code: str = Field(min_length=1, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
     legal_name: str = Field(min_length=1, max_length=200)
     base_currency: str = Field(default="SGD", pattern=r"^[A-Z]{3}$")
@@ -131,10 +149,18 @@ class ClientCreate(BaseModel):
 
 
 class ClientUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     legal_name: str | None = Field(default=None, min_length=1, max_length=200)
     base_currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
     features: ClientFeatures | None = None
     status: Literal["ACTIVE", "DISABLED"] | None = None
+
+    @model_validator(mode="after")
+    def reject_null_updates(self):
+        if any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError("Updated fields cannot be null")
+        return self
 
 
 class ClientOut(BaseModel):
@@ -174,3 +200,33 @@ class AssignmentUpdate(BaseModel):
 
 class AssignmentOut(BaseModel):
     user_ids: list[UUID]
+
+
+class BankAccountCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    bank: str = Field(min_length=1, max_length=100)
+    account_last4: str = Field(pattern=r"^[0-9]{4}$")
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    status: UserStatus = "ACTIVE"
+
+
+class BankAccountUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    bank: str | None = Field(default=None, min_length=1, max_length=100)
+    account_last4: str | None = Field(default=None, pattern=r"^[0-9]{4}$")
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    status: UserStatus | None = None
+
+    @model_validator(mode="after")
+    def reject_null_updates(self):
+        if any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError("Updated fields cannot be null")
+        return self
+
+
+class BankAccountOut(BankAccountCreate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID

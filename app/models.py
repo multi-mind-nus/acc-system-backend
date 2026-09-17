@@ -114,6 +114,27 @@ class ClientMember(Base):
     )
 
 
+class ClientBankAccount(Base):
+    __tablename__ = "client_bank_accounts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "client_id"], ["clients.firm_id", "clients.id"]
+        ),
+        CheckConstraint("account_last4 ~ '^[0-9]{4}$'"),
+        CheckConstraint("currency ~ '^[A-Z]{3}$'"),
+        CheckConstraint("status IN ('ACTIVE', 'DISABLED')"),
+        Index("ix_client_bank_accounts_firm_client", "firm_id", "client_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    client_id: Mapped[UUID]
+    bank: Mapped[str] = mapped_column(String(100))
+    account_last4: Mapped[str] = mapped_column(String(4))
+    currency: Mapped[str] = mapped_column(String(3))
+    status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
+
+
 class ClientAssignment(Base):
     __tablename__ = "client_assignments"
     __table_args__ = (

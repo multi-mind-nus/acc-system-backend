@@ -11,6 +11,7 @@ from app.auth import (
     Principal,
     ensure_client_access,
     hash_token,
+    lock_firm,
     normalize_email,
     opaque_token,
     require_firm_role,
@@ -22,6 +23,7 @@ from app.models import (
     AuditEvent,
     Client,
     ClientAssignment,
+    ClientBankAccount,
     ClientMember,
     FirmMember,
     User,
@@ -30,6 +32,9 @@ from app.models import (
 from app.schemas import (
     AssignmentOut,
     AssignmentUpdate,
+    BankAccountCreate,
+    BankAccountOut,
+    BankAccountUpdate,
     ClientCreate,
     ClientInvitationRequest,
     ClientListOut,
@@ -37,10 +42,15 @@ from app.schemas import (
     ClientMemberUpdate,
     ClientOut,
     ClientUpdate,
+    FirmRole,
+    InvitationListItem,
+    InvitationListOut,
     InvitationOut,
+    MessageResponse,
     StaffInvitationRequest,
     UserListOut,
     UserOut,
+    UserStatus,
     UserUpdate,
 )
 
@@ -114,6 +124,15 @@ def _create_invitation(
     role: str,
     client_id: UUID | None = None,
 ) -> InvitationOut:
+    lock_firm(db, principal.firm.id)
+    if client_id is not None:
+        client = db.scalar(
+            select(Client).where(
+                Client.id == client_id, Client.firm_id == principal.firm.id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )
+        if client is None or client.status != "ACTIVE":
+            raise APIError(409, "CLIENT_DISABLED", "Enable this client before inviting members")
     normalized_email = normalize_email(email)
     now = datetime.now(UTC)
     existing_user = db.scalar(
@@ -121,6 +140,8 @@ def _create_invitation(
     )
     if existing_user and existing_user.firm_id != principal.firm.id:
         raise APIError(409, "EMAIL_UNAVAILABLE", "This email cannot be invited")
+    if existing_user and existing_user.status != "ACTIVE":
+        raise APIError(409, "ACCOUNT_DISABLED", "Enable this account before inviting it")
     if existing_user and scope == "FIRM" and db.get(
         FirmMember, (principal.firm.id, existing_user.id)
     ):
@@ -137,7 +158,7 @@ def _create_invitation(
             func.lower(UserInvite.email) == normalized_email,
             UserInvite.accepted_at.is_(None),
             UserInvite.revoked_at.is_(None),
-        )
+        ).with_for_update()
     ).all()
     for old_invite in active_invites:
         old_invite.revoked_at = now
@@ -172,8 +193,24 @@ def list_users(
     db: DbSession,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    search: str | None = Query(default=None, max_length=100),
+    status: UserStatus | None = None,
+    role: FirmRole | None = None,
+    staff_only: bool = False,
 ) -> UserListOut:
     base = select(User).where(User.firm_id == principal.firm.id)
+    if staff_only or role:
+        base = base.join(
+            FirmMember,
+            (FirmMember.firm_id == User.firm_id) & (FirmMember.user_id == User.id),
+        )
+    if role:
+        base = base.where(FirmMember.role == role)
+    if status:
+        base = base.where(User.status == status)
+    if search:
+        query = f"%{search.strip()}%"
+        base = base.where(or_(User.name.ilike(query), User.email.ilike(query)))
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     users = db.scalars(
         base.order_by(User.name, User.id).offset((page - 1) * page_size).limit(page_size)
@@ -208,6 +245,7 @@ def update_user(
     principal: FirmAdmin,
     db: DbSession,
 ) -> UserOut:
+    lock_firm(db, principal.firm.id)
     user = db.scalar(
         select(User).where(User.id == user_id, User.firm_id == principal.firm.id)
     )
@@ -230,11 +268,18 @@ def update_user(
         )
         if member is None:
             raise APIError(400, "STAFF_MEMBERSHIP_REQUIRED", "User is not a staff member")
-        if member.role == "FIRM_ADMIN" and payload.role != "FIRM_ADMIN":
+        if (
+            member.role == "FIRM_ADMIN"
+            and payload.role != "FIRM_ADMIN"
+            and user.status == "ACTIVE"
+        ):
             admin_count = db.scalar(
                 select(func.count()).select_from(FirmMember).where(
                     FirmMember.firm_id == principal.firm.id,
                     FirmMember.role == "FIRM_ADMIN",
+                    FirmMember.user_id.in_(
+                        select(User.id).where(User.status == "ACTIVE")
+                    ),
                 )
             )
             if admin_count == 1:
@@ -256,6 +301,7 @@ def list_clients(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     search: str | None = Query(default=None, max_length=100),
+    status: UserStatus | None = None,
 ) -> ClientListOut:
     base = select(Client).where(Client.firm_id == principal.firm.id)
     if principal.firm_role == "ACCOUNTANT":
@@ -272,6 +318,8 @@ def list_clients(
         base = base.where(
             or_(Client.code.ilike(query), Client.legal_name.ilike(query))
         )
+    if status:
+        base = base.where(Client.status == status)
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     clients = db.scalars(
         base.order_by(Client.legal_name, Client.id)
@@ -381,6 +429,9 @@ def update_client_member(
     ensure_client_access(
         db, principal, client_id, client_roles=("CLIENT_ADMIN",)
     )
+    # The client row serializes demotions/removals, so concurrent requests cannot
+    # each see a different "other administrator" and remove the last two.
+    db.scalar(select(Client).where(Client.id == client_id).with_for_update())
     member = db.get(
         ClientMember, (principal.firm.id, client_id, user_id)
     )
@@ -391,6 +442,27 @@ def update_client_member(
     )
     if user is None:
         raise APIError(404, "CLIENT_MEMBER_NOT_FOUND", "Client member not found")
+    if member.role == "CLIENT_ADMIN" and (
+        not payload.active or payload.role != "CLIENT_ADMIN"
+    ):
+        other_admin = db.scalar(
+            select(ClientMember.user_id).join(
+                User,
+                (User.id == ClientMember.user_id)
+                & (User.firm_id == ClientMember.firm_id),
+            ).where(
+                ClientMember.firm_id == principal.firm.id,
+                ClientMember.client_id == client_id,
+                ClientMember.role == "CLIENT_ADMIN",
+                ClientMember.user_id != user_id,
+                User.status == "ACTIVE",
+            ).limit(1)
+        )
+        if other_admin is None:
+            raise APIError(
+                409, "LAST_CLIENT_ADMIN_REQUIRED",
+                "The client must keep at least one active administrator",
+            )
     if not payload.active:
         db.delete(member)
         _audit(db, principal, "CLIENT_MEMBER_REMOVED", "USER", user.id)
@@ -406,6 +478,21 @@ def update_client_member(
         status=user.status,
         role=member.role,
     )
+
+
+@router.get("/clients/{client_id}/assignments", response_model=AssignmentOut)
+def get_assignments(
+    client_id: UUID,
+    principal: Annotated[Principal, Depends(require_firm_role("FIRM_ADMIN", "ACCOUNTANT"))],
+    db: DbSession,
+) -> AssignmentOut:
+    ensure_client_access(db, principal, client_id)
+    return AssignmentOut(user_ids=list(db.scalars(
+        select(ClientAssignment.user_id).where(
+            ClientAssignment.firm_id == principal.firm.id,
+            ClientAssignment.client_id == client_id,
+        ).order_by(ClientAssignment.user_id)
+    ).all()))
 
 
 @router.put("/clients/{client_id}/assignments", response_model=AssignmentOut)
@@ -488,3 +575,158 @@ def invite_client_member(
         role=payload.role,
         client_id=client_id,
     )
+
+
+def _list_invitations(db, principal, client_id, page, page_size) -> InvitationListOut:
+    base = select(UserInvite).where(
+        UserInvite.firm_id == principal.firm.id,
+        UserInvite.client_id == client_id,
+        UserInvite.scope == ("CLIENT" if client_id else "FIRM"),
+    )
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    invites = db.scalars(
+        base.order_by(UserInvite.created_at.desc(), UserInvite.id)
+        .offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    now = datetime.now(UTC)
+    return InvitationListOut(
+        items=[InvitationListItem(
+            id=invite.id,
+            email=invite.email,
+            role=invite.role,
+            expires_at=invite.expires_at,
+            created_at=invite.created_at,
+            status=("ACCEPTED" if invite.accepted_at else
+                    "REVOKED" if invite.revoked_at else
+                    "EXPIRED" if invite.expires_at <= now else "PENDING"),
+        ) for invite in invites],
+        total=total, page=page, page_size=page_size,
+    )
+
+
+def _change_invitation(db, principal, client_id, invite_id, *, resend):
+    lock_firm(db, principal.firm.id)
+    if client_id is not None:
+        ensure_client_access(db, principal, client_id, client_roles=("CLIENT_ADMIN",))
+        db.scalar(select(Client).where(Client.id == client_id).with_for_update())
+    invite = db.scalar(select(UserInvite).where(
+        UserInvite.id == invite_id,
+        UserInvite.firm_id == principal.firm.id,
+        UserInvite.client_id == client_id,
+        UserInvite.scope == ("CLIENT" if client_id else "FIRM"),
+    ).with_for_update())
+    if invite is None:
+        raise APIError(404, "INVITATION_NOT_FOUND", "Invitation not found")
+    if invite.accepted_at is not None:
+        raise APIError(409, "INVITATION_ALREADY_ACCEPTED", "Invitation was already accepted")
+    invite.revoked_at = invite.revoked_at or datetime.now(UTC)
+    _audit(db, principal, "INVITATION_REVOKED", "USER_INVITE", invite.id)
+    if resend:
+        return _create_invitation(
+            db, principal, email=invite.email, scope=invite.scope,
+            role=invite.role, client_id=client_id,
+        )
+    db.commit()
+    return MessageResponse(message="Invitation revoked")
+
+
+@router.get("/users/invitations", response_model=InvitationListOut)
+def list_staff_invitations(
+    principal: FirmAdmin, db: DbSession,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> InvitationListOut:
+    return _list_invitations(db, principal, None, page, page_size)
+
+
+@router.post("/users/invitations/{invite_id}/revoke", response_model=MessageResponse)
+def revoke_staff_invitation(
+    invite_id: UUID, principal: FirmAdmin, db: DbSession,
+) -> MessageResponse:
+    return _change_invitation(db, principal, None, invite_id, resend=False)
+
+
+@router.post("/users/invitations/{invite_id}/resend", response_model=InvitationOut)
+def resend_staff_invitation(
+    invite_id: UUID, principal: FirmAdmin, db: DbSession,
+) -> InvitationOut:
+    return _change_invitation(db, principal, None, invite_id, resend=True)
+
+
+@router.get("/clients/{client_id}/invitations", response_model=InvitationListOut)
+def list_client_invitations(
+    client_id: UUID, principal: CurrentPrincipal, db: DbSession,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> InvitationListOut:
+    ensure_client_access(db, principal, client_id, client_roles=("CLIENT_ADMIN",))
+    return _list_invitations(db, principal, client_id, page, page_size)
+
+
+@router.post(
+    "/clients/{client_id}/invitations/{invite_id}/revoke", response_model=MessageResponse,
+)
+def revoke_client_invitation(
+    client_id: UUID, invite_id: UUID, principal: CurrentPrincipal, db: DbSession,
+) -> MessageResponse:
+    return _change_invitation(db, principal, client_id, invite_id, resend=False)
+
+
+@router.post(
+    "/clients/{client_id}/invitations/{invite_id}/resend", response_model=InvitationOut,
+)
+def resend_client_invitation(
+    client_id: UUID, invite_id: UUID, principal: CurrentPrincipal, db: DbSession,
+) -> InvitationOut:
+    return _change_invitation(db, principal, client_id, invite_id, resend=True)
+
+
+@router.get("/clients/{client_id}/bank-accounts", response_model=list[BankAccountOut])
+def list_bank_accounts(
+    client_id: UUID, principal: CurrentPrincipal, db: DbSession,
+) -> list[BankAccountOut]:
+    ensure_client_access(db, principal, client_id)
+    accounts = db.scalars(select(ClientBankAccount).where(
+        ClientBankAccount.firm_id == principal.firm.id,
+        ClientBankAccount.client_id == client_id,
+    ).order_by(ClientBankAccount.bank, ClientBankAccount.account_last4, ClientBankAccount.id))
+    return [BankAccountOut.model_validate(account) for account in accounts]
+
+
+@router.post(
+    "/clients/{client_id}/bank-accounts", response_model=BankAccountOut, status_code=201,
+)
+def create_bank_account(
+    client_id: UUID, payload: BankAccountCreate, principal: FirmAdmin, db: DbSession,
+) -> BankAccountOut:
+    ensure_client_access(db, principal, client_id)
+    account = ClientBankAccount(
+        firm_id=principal.firm.id, client_id=client_id, **payload.model_dump(),
+    )
+    db.add(account)
+    db.flush()
+    _audit(db, principal, "BANK_ACCOUNT_CREATED", "CLIENT_BANK_ACCOUNT", account.id)
+    db.commit()
+    return BankAccountOut.model_validate(account)
+
+
+@router.patch(
+    "/clients/{client_id}/bank-accounts/{bank_id}", response_model=BankAccountOut,
+)
+def update_bank_account(
+    client_id: UUID, bank_id: UUID, payload: BankAccountUpdate,
+    principal: FirmAdmin, db: DbSession,
+) -> BankAccountOut:
+    ensure_client_access(db, principal, client_id)
+    account = db.scalar(select(ClientBankAccount).where(
+        ClientBankAccount.id == bank_id,
+        ClientBankAccount.firm_id == principal.firm.id,
+        ClientBankAccount.client_id == client_id,
+    ))
+    if account is None:
+        raise APIError(404, "BANK_ACCOUNT_NOT_FOUND", "Bank account not found")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(account, key, value)
+    _audit(db, principal, "BANK_ACCOUNT_UPDATED", "CLIENT_BANK_ACCOUNT", account.id)
+    db.commit()
+    return BankAccountOut.model_validate(account)
