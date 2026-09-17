@@ -9,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import db
-from app.api import accounts, auth
+from app.api import accounts, auth, collections
 from app.config import settings
 from app.errors import APIError
 from app.logging_config import configure_logging
@@ -21,6 +21,8 @@ request_id_pattern = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 app.include_router(auth.router)
 app.include_router(accounts.router)
+app.include_router(collections.router)
+app.include_router(collections.requirements_router)
 
 
 def error_response(

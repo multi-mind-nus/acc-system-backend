@@ -1,13 +1,17 @@
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
     CheckConstraint,
+    Boolean,
+    Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -206,6 +210,134 @@ class AuditEvent(Base):
     target_type: Mapped[str | None] = mapped_column(String(64))
     target_id: Mapped[UUID | None]
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class CollectionRequest(Base):
+    __tablename__ = "collection_requests"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "client_id"], ["clients.firm_id", "clients.id"]
+        ),
+        ForeignKeyConstraint(
+            ["firm_id", "assignee_id"],
+            ["firm_members.firm_id", "firm_members.user_id"],
+        ),
+        CheckConstraint(
+            "status IN ('DRAFT', 'OPEN', 'IN_REVIEW', 'CHANGES_REQUESTED', "
+            "'READY_FOR_BOOKKEEPING', 'CLOSED', 'CANCELLED')"
+        ),
+        UniqueConstraint("firm_id", "client_id", "period"),
+        UniqueConstraint("firm_id", "id"),
+        Index("ix_collection_requests_dashboard", "firm_id", "status", "due_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    client_id: Mapped[UUID]
+    period: Mapped[date] = mapped_column(Date)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(32), default="DRAFT")
+    scope_note: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    assignee_id: Mapped[UUID]
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __mapper_args__ = {"version_id_col": version}
+
+
+class Requirement(Base):
+    __tablename__ = "requirements"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "request_id"],
+            ["collection_requests.firm_id", "collection_requests.id"],
+        ),
+        CheckConstraint("origin IN ('INITIAL', 'FOLLOW_UP')"),
+        CheckConstraint(
+            "status IN ('PENDING', 'RECEIVED', 'NEEDS_ACTION', 'SATISFIED', 'WAIVED')"
+        ),
+        CheckConstraint(
+            "issue_code IS NULL OR issue_code IN ('MISSING', 'WRONG_PERIOD', "
+            "'ENTITY_MISMATCH', 'UNREADABLE', 'INCOMPLETE', 'OTHER')"
+        ),
+        UniqueConstraint("firm_id", "id"),
+        Index("ix_requirements_request", "request_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    request_id: Mapped[UUID]
+    origin: Mapped[str] = mapped_column(String(16), default="INITIAL")
+    type: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(200))
+    position: Mapped[int] = mapped_column(Integer)
+    required: Mapped[bool] = mapped_column(Boolean, default=True)
+    criteria: Mapped[dict] = mapped_column(JSONB, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING")
+    issue_code: Mapped[str | None] = mapped_column(String(32))
+    client_message: Mapped[str | None] = mapped_column(Text)
+    internal_note: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    reviewed_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __mapper_args__ = {"version_id_col": version}
+
+
+class WorkflowEvent(Base):
+    __tablename__ = "workflow_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "request_id"],
+            ["collection_requests.firm_id", "collection_requests.id"],
+        ),
+        Index("ix_workflow_events_request_created", "request_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    request_id: Mapped[UUID]
+    actor_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    event_type: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        CheckConstraint("status IN ('PROCESSING', 'COMPLETED')"),
+        UniqueConstraint("firm_id", "actor_id", "key"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    actor_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    key: Mapped[str] = mapped_column(String(128))
+    method: Mapped[str] = mapped_column(String(8))
+    path: Mapped[str] = mapped_column(String(300))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="PROCESSING")
+    status_code: Mapped[int | None] = mapped_column(Integer)
+    response_body: Mapped[dict | None] = mapped_column(JSONB)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
