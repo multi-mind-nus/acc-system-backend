@@ -217,6 +217,20 @@ def test_versions_publish_idempotency_and_immutable_requirements(records) -> Non
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == "CANCELLED"
         assert cancelled.json()["events"][0]["payload"]["reason"] == "Client engagement ended"
+        recreated = client.post(
+            "/api/v1/collection-requests",
+            headers=idempotent(headers, "create-after-cancel-1"),
+            json=payload(records["first"], records["accountant"]),
+        )
+        assert recreated.status_code == 201, recreated.text
+        assert recreated.json()["id"] != request_id
+        duplicate = client.post(
+            "/api/v1/collection-requests",
+            headers=idempotent(headers, "create-after-cancel-2"),
+            json=payload(records["first"], records["accountant"]),
+        )
+        assert duplicate.status_code == 409
+        assert duplicate.json()["code"] == "COLLECTION_EXISTS"
         with SessionLocal() as db:
             assert db.scalar(select(func.count(WorkflowEvent.id)).where(
                 WorkflowEvent.request_id == UUID(request_id),

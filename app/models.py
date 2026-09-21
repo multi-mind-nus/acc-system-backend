@@ -2,6 +2,7 @@ from datetime import date, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Boolean,
     Date,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -229,7 +231,14 @@ class CollectionRequest(Base):
             "status IN ('DRAFT', 'OPEN', 'IN_REVIEW', 'CHANGES_REQUESTED', "
             "'READY_FOR_BOOKKEEPING', 'CLOSED', 'CANCELLED')"
         ),
-        UniqueConstraint("firm_id", "client_id", "period"),
+        Index(
+            "uq_collection_requests_active_period",
+            "firm_id",
+            "client_id",
+            "period",
+            unique=True,
+            postgresql_where=text("status <> 'CANCELLED'"),
+        ),
         UniqueConstraint("firm_id", "id"),
         Index("ix_collection_requests_dashboard", "firm_id", "status", "due_at"),
     )
@@ -338,6 +347,93 @@ class IdempotencyRecord(Base):
     status_code: Mapped[int | None] = mapped_column(Integer)
     response_body: Mapped[dict | None] = mapped_column(JSONB)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Submission(Base):
+    __tablename__ = "submissions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "request_id"],
+            ["collection_requests.firm_id", "collection_requests.id"],
+        ),
+        CheckConstraint("status IN ('DRAFT', 'SUBMITTED')"),
+        UniqueConstraint("request_id", "round_no"),
+        Index("ix_submissions_request_status", "request_id", "status"),
+        Index(
+            "uq_submissions_one_draft",
+            "request_id",
+            unique=True,
+            postgresql_where=text("status = 'DRAFT'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    request_id: Mapped[UUID]
+    round_no: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT")
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "client_id"], ["clients.firm_id", "clients.id"]
+        ),
+        CheckConstraint("status IN ('QUARANTINED', 'AVAILABLE', 'FAILED')"),
+        Index("ix_documents_scan_queue", "status", "next_attempt_at"),
+        Index("ix_documents_client_sha", "firm_id", "client_id", "sha256"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    client_id: Mapped[UUID]
+    uploader_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    original_name: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(100))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    storage_key: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(16), default="QUARANTINED")
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    locked_by: Mapped[str | None] = mapped_column(String(100))
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RequirementDocument(Base):
+    __tablename__ = "requirement_documents"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["firm_id", "request_id"],
+            ["collection_requests.firm_id", "collection_requests.id"],
+        ),
+        Index("ix_requirement_documents_submission", "submission_id"),
+        Index("ix_requirement_documents_document", "document_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    request_id: Mapped[UUID]
+    submission_id: Mapped[UUID] = mapped_column(ForeignKey("submissions.id"))
+    requirement_id: Mapped[UUID | None] = mapped_column(ForeignKey("requirements.id"))
+    document_id: Mapped[UUID] = mapped_column(ForeignKey("documents.id"))
+    document_type: Mapped[str] = mapped_column(String(64))
+    excluded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    excluded_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

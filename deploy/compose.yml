@@ -5,6 +5,9 @@ x-backend-environment: &backend-environment
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
   REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
   WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-10}
+  MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+  CLAMAV_HOST: ${CLAMAV_HOST:-}
+  CLAMAV_PORT: ${CLAMAV_PORT:-3310}
   JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
   JWT_ISSUER: ${JWT_ISSUER:-acc-system}
   JWT_AUDIENCE: ${JWT_AUDIENCE:-acc-system-web}
@@ -42,6 +45,15 @@ services:
     restart: unless-stopped
     volumes:
       - redis_data:/data
+    networks:
+      - internal
+
+  clamav:
+    image: ${CLAMAV_IMAGE:-clamav/clamav:1.4}
+    profiles: ["malware-scan"]
+    restart: unless-stopped
+    volumes:
+      - clamav_data:/var/lib/clamav
     networks:
       - internal
 
@@ -145,6 +157,7 @@ networks:
     driver: bridge
 
 volumes:
+  clamav_data:
   documents:
   postgres_data:
   quarantine:

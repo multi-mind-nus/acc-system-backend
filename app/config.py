@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://acc:acc@localhost:5432/acc"
     redis_url: str = "redis://localhost:6379/0"
     worker_poll_seconds: float = 10.0
+    max_upload_bytes: int = 25 * 1024 * 1024
+    quarantine_path: str = "/data/quarantine"
+    document_path: str = "/data/documents"
+    clamav_host: str | None = None
+    clamav_port: int = 3310
     jwt_secret: SecretStr = SecretStr("local-development-only-change-me")
     jwt_issuer: str = "acc-system"
     jwt_audience: str = "acc-system-web"

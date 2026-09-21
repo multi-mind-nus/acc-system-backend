@@ -334,6 +334,7 @@ def create_collection(
         CollectionRequest.firm_id == principal.firm.id,
         CollectionRequest.client_id == body.client_id,
         CollectionRequest.period == body.period,
+        CollectionRequest.status != "CANCELLED",
     )):
         raise APIError(409, "COLLECTION_EXISTS", "A request already exists for this period")
     assignee_id = body.assignee_id or principal.user.id
@@ -472,6 +473,7 @@ def copy_collection(
         CollectionRequest.firm_id == principal.firm.id,
         CollectionRequest.client_id == source.client_id,
         CollectionRequest.period == period,
+        CollectionRequest.status != "CANCELLED",
     )):
         raise APIError(409, "COLLECTION_EXISTS", "A request already exists for this period")
     month_delta = (period.year - source.period.year) * 12 + period.month - source.period.month

@@ -45,6 +45,8 @@ Run commands from the `deploy/` directory. Set `JWT_SECRET` to a random value (f
 
 Set `FRONTEND_ORIGIN` to the exact browser origin, including the scheme and any non-default port. `http://localhost` is for local acceptance only; visiting through a different host without changing this value prevents refresh and logout.
 
+For production document uploads, set `CLAMAV_HOST=clamav` and start Compose with `--profile malware-scan`. The Worker deliberately refuses to release files without ClamAV when `ENVIRONMENT=production`; development uses the built-in EICAR check for local acceptance only.
+
 The backend is reachable only on the Compose network and trusts the forwarding headers that Nginx overwrites with the actual connection address. Do not publish the backend port or attach untrusted containers to this network. If another proxy is added in front of Nginx, configure its trusted addresses explicitly before relying on client-IP rate limits.
 
 ## TLS (required for public production)
