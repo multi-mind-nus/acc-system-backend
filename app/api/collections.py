@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.auth import Principal, ensure_client_access, lock_firm, require_firm_role
 from app.collection_schemas import (
@@ -52,12 +52,17 @@ def _event(
     db, principal: Principal, request_id: UUID, event_type: str,
     payload: dict | None = None,
 ) -> None:
+    now = datetime.now(UTC)
+    db.execute(update(CollectionRequest).where(
+        CollectionRequest.id == request_id,
+    ).values(updated_at=now))
     db.add(WorkflowEvent(
         firm_id=principal.firm.id,
         request_id=request_id,
         actor_id=principal.user.id,
         event_type=event_type,
         payload=payload or {},
+        created_at=now,
     ))
 
 
@@ -102,6 +107,7 @@ def _summary(
         assignee_id=item.assignee_id,
         assignee_name=assignee_name,
         requirement_count=requirement_count,
+        updated_at=item.updated_at,
     )
 
 
@@ -286,8 +292,8 @@ def list_collections(
     assignee_id: UUID | None = None,
     due_from: datetime | None = None,
     due_to: datetime | None = None,
-    sort: Literal["due_at", "period", "created_at"] = "due_at",
-    order: Literal["asc", "desc"] = "asc",
+    sort: Literal["due_at", "period", "created_at", "updated_at"] = "updated_at",
+    order: Literal["asc", "desc"] = "desc",
 ):
     statement = _list_statement(principal)
     if client_id:
@@ -520,18 +526,24 @@ def add_requirement(
     request_id: UUID, body: RequirementInput, db: DbSession, principal: Staff,
 ):
     item = _load_request(db, principal, request_id, lock=True)
-    if item.status != "DRAFT":
+    if item.status not in ("DRAFT", "IN_REVIEW"):
         raise APIError(409, "COLLECTION_NOT_EDITABLE", "Published requirements cannot be changed")
+    follow_up = item.status == "IN_REVIEW"
     requirement = Requirement(
         firm_id=principal.firm.id,
         request_id=item.id,
+        origin="FOLLOW_UP" if follow_up else "INITIAL",
         position=db.scalar(select(func.coalesce(func.max(Requirement.position), -1)).where(
             Requirement.request_id == item.id
         )) + 1,
         **body.model_dump(),
     )
     db.add(requirement)
-    _event(db, principal, item.id, "REQUIREMENT_ADDED", {"title": body.title})
+    if follow_up:
+        item.status = "CHANGES_REQUESTED"
+        _event(db, principal, item.id, "FOLLOW_UP_ADDED", {"title": body.title})
+    else:
+        _event(db, principal, item.id, "REQUIREMENT_ADDED", {"title": body.title})
     db.commit()
     return requirement
 

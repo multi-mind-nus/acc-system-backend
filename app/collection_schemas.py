@@ -94,6 +94,7 @@ class CollectionSummaryOut(BaseModel):
     assignee_id: UUID
     assignee_name: str
     requirement_count: int
+    updated_at: datetime
 
 
 class WorkflowEventOut(BaseModel):

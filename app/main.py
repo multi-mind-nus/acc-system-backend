@@ -9,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import db
-from app.api import accounts, auth, collections, portal
+from app.api import accounts, auth, collections, portal, review
 from app.config import settings
 from app.errors import APIError
 from app.logging_config import configure_logging
@@ -24,6 +24,7 @@ app.include_router(accounts.router)
 app.include_router(collections.router)
 app.include_router(collections.requirements_router)
 app.include_router(portal.router)
+app.include_router(review.router)
 
 
 def error_response(

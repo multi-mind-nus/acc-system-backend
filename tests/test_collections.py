@@ -279,6 +279,19 @@ def test_copy_and_combined_filters_do_not_leak_tenants(records) -> None:
         assert filtered.json()["items"][0]["id"] == copy_body["id"]
 
         with SessionLocal.begin() as db:
+            db.get(CollectionRequest, UUID(source["id"])).updated_at = datetime(2026, 11, 2, tzinfo=UTC)
+            db.get(CollectionRequest, UUID(copy_body["id"])).updated_at = datetime(2026, 11, 1, tzinfo=UTC)
+        recently_updated = client.get(
+            "/api/v1/collection-requests", headers=headers,
+            params={"sort": "updated_at", "order": "desc"},
+        )
+        assert recently_updated.status_code == 200
+        assert [item["id"] for item in recently_updated.json()["items"][:2]] == [
+            source["id"], copy_body["id"],
+        ]
+        assert recently_updated.json()["items"][0]["updated_at"].startswith("2026-11-02")
+
+        with SessionLocal.begin() as db:
             other_firm = Firm(name="Other Firm")
             db.add(other_firm)
             db.flush()

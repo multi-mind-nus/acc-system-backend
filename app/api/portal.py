@@ -1,8 +1,8 @@
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -11,6 +11,7 @@ from fastapi.responses import Response
 from sqlalchemy import func, select
 
 from app.auth import Principal, current_principal, ensure_client_access
+from app.collection_schemas import CollectionStatus
 from app.config import settings
 from app.db import DbSession
 from app.errors import APIError
@@ -34,6 +35,7 @@ from app.portal_schemas import (
     PortalDocumentOut,
     PortalRequirementOut,
     PortalSubmissionOut,
+    PortalSubmitInput,
     PortalUploadOut,
 )
 
@@ -102,7 +104,12 @@ def _draft_submission(db, item: CollectionRequest, principal: Principal) -> Subm
 
 
 def _document_out(
-    document: Document, link: RequirementDocument | None = None, *, duplicate=False
+    document: Document,
+    link: RequirementDocument | None = None,
+    *,
+    duplicate=False,
+    editable=False,
+    counts_for_submission=False,
 ) -> PortalDocumentOut:
     if link is None:
         raise ValueError("A document response requires its submission link")
@@ -115,6 +122,8 @@ def _document_out(
         status="EXCLUDED" if link and link.excluded_at else document.status,
         failure_code=document.failure_code,
         duplicate=duplicate,
+        editable=editable,
+        counts_for_submission=counts_for_submission,
         created_at=document.created_at,
     )
 
@@ -128,6 +137,30 @@ def _links(db, submission_id: UUID | None):
         .where(RequirementDocument.submission_id == submission_id)
         .order_by(RequirementDocument.created_at, RequirementDocument.id)
     ).all()
+
+
+def _effective_links(db, request_id: UUID):
+    rows = db.execute(
+        select(RequirementDocument, Document, Submission)
+        .join(Document, Document.id == RequirementDocument.document_id)
+        .join(Submission, Submission.id == RequirementDocument.submission_id)
+        .where(RequirementDocument.request_id == request_id)
+        .order_by(Submission.round_no, RequirementDocument.created_at, RequirementDocument.id)
+    ).all()
+    effective = {}
+    for link, document, submission in rows:
+        effective[(link.requirement_id, document.id)] = (link, document, submission)
+    return list(effective.values())
+
+
+def _requirement_editable(
+    item: CollectionRequest, requirement: Requirement | None
+) -> bool:
+    return item.status == "OPEN" or (
+        item.status == "CHANGES_REQUESTED"
+        and requirement is not None
+        and requirement.status == "NEEDS_ACTION"
+    )
 
 
 def _summary(db, item: CollectionRequest) -> PortalCollectionSummaryOut:
@@ -149,7 +182,16 @@ def _summary(db, item: CollectionRequest) -> PortalCollectionSummaryOut:
         status=item.status,
         assignee_name=db.get(User, item.assignee_id).name,
         required_count=sum(requirement.required for requirement in requirements),
-        ready_count=sum(requirement.required and requirement.id in ready_ids for requirement in requirements),
+        ready_count=sum(
+            requirement.required
+            and requirement.status != "NEEDS_ACTION"
+            and (
+                requirement.status in ("SATISFIED", "WAIVED")
+                or requirement.id in ready_ids
+            )
+            for requirement in requirements
+        ),
+        updated_at=item.updated_at,
     )
 
 
@@ -158,10 +200,21 @@ def _detail(db, item: CollectionRequest) -> PortalCollectionDetailOut:
         select(Requirement).where(Requirement.request_id == item.id).order_by(Requirement.position)
     ))
     latest = _submission(db, item.id)
-    rows = _links(db, latest.id if latest else None)
+    rows = _effective_links(db, item.id)
+    requirements_by_id = {requirement.id: requirement for requirement in requirements}
     by_requirement: dict[UUID | None, list[PortalDocumentOut]] = {}
-    for link, document in rows:
-        by_requirement.setdefault(link.requirement_id, []).append(_document_out(document, link))
+    current_draft_id = latest.id if latest and latest.status == "DRAFT" else None
+    for link, document, _ in rows:
+        if link.excluded_at:
+            continue
+        by_requirement.setdefault(link.requirement_id, []).append(_document_out(
+            document,
+            link,
+            editable=_requirement_editable(
+                item, requirements_by_id.get(link.requirement_id)
+            ),
+            counts_for_submission=link.submission_id == current_draft_id,
+        ))
     summary = _summary(db, item)
     return PortalCollectionDetailOut(
         **summary.model_dump(),
@@ -190,17 +243,33 @@ def _detail(db, item: CollectionRequest) -> PortalCollectionDetailOut:
 
 
 @router.get("/collection-requests", response_model=PortalCollectionListOut)
-def list_collections(db: DbSession, principal: PortalUser):
+def list_collections(
+    db: DbSession,
+    principal: PortalUser,
+    client_id: UUID | None = None,
+    period: date | None = None,
+    status: CollectionStatus | None = None,
+    sort: Literal["due_at", "period", "updated_at"] = "updated_at",
+    order: Literal["asc", "desc"] = "desc",
+):
     client_ids = [client.id for member, client in principal.client_memberships]
-    items = list(db.scalars(
-        select(CollectionRequest)
-        .where(
-            CollectionRequest.firm_id == principal.firm.id,
-            CollectionRequest.client_id.in_(client_ids),
-            CollectionRequest.status != "DRAFT",
-        )
-        .order_by(CollectionRequest.due_at.desc())
-    )) if client_ids else []
+    statement = select(CollectionRequest).where(
+        CollectionRequest.firm_id == principal.firm.id,
+        CollectionRequest.client_id.in_(client_ids),
+        CollectionRequest.status != "DRAFT",
+    )
+    if client_id:
+        statement = statement.where(CollectionRequest.client_id == client_id)
+    if period:
+        statement = statement.where(CollectionRequest.period == period)
+    if status:
+        statement = statement.where(CollectionRequest.status == status)
+    sort_column = getattr(CollectionRequest, sort)
+    statement = statement.order_by(
+        sort_column.desc() if order == "desc" else sort_column.asc(),
+        CollectionRequest.id,
+    )
+    items = list(db.scalars(statement)) if client_ids else []
     return PortalCollectionListOut(items=[_summary(db, item) for item in items], total=len(items))
 
 
@@ -222,9 +291,9 @@ def classify_documents(
     item = _load_request(db, principal, request_id)
     if item.status not in ("OPEN", "CHANGES_REQUESTED"):
         raise APIError(409, "SUBMISSION_READ_ONLY", "This submission can no longer be changed")
-    requirements = list(db.scalars(
+    requirements = [requirement for requirement in db.scalars(
         select(Requirement).where(Requirement.request_id == item.id).order_by(Requirement.position)
-    ))
+    ) if _requirement_editable(item, requirement)]
     results = []
     for index, file in enumerate(body.files):
         name = file.name.casefold()
@@ -282,6 +351,10 @@ async def upload_document(
         ))
         if requirement is None:
             raise APIError(404, "REQUIREMENT_NOT_FOUND", "Requirement not found")
+    if not _requirement_editable(item, requirement):
+        raise APIError(
+            409, "SUBMISSION_READ_ONLY", "This requirement cannot be changed"
+        )
 
     document_id = uuid4()
     quarantine_path = Path(settings.quarantine_path) / f"{document_id}.part"
@@ -327,7 +400,10 @@ async def upload_document(
             db.commit()
             return PortalUploadOut(
                 submission_id=draft.id,
-                document=_document_out(existing, link, duplicate=True),
+                document=_document_out(
+                    existing, link, duplicate=True, editable=True,
+                    counts_for_submission=True,
+                ),
             )
 
         document = Document(
@@ -350,7 +426,12 @@ async def upload_document(
         )
         db.add(link)
         db.commit()
-        return PortalUploadOut(submission_id=draft.id, document=_document_out(document, link))
+        return PortalUploadOut(
+            submission_id=draft.id,
+            document=_document_out(
+                document, link, editable=True, counts_for_submission=True,
+            ),
+        )
     except Exception:
         quarantine_path.unlink(missing_ok=True)
         raise
@@ -382,8 +463,14 @@ def _load_document_link(db, principal: Principal, document_id: UUID):
 
 @router.get("/documents/{document_id}", response_model=PortalDocumentOut)
 def get_document(document_id: UUID, db: DbSession, principal: PortalUser):
-    link, document, _, _ = _load_document_link(db, principal, document_id)
-    return _document_out(document, link)
+    link, document, submission, item = _load_document_link(db, principal, document_id)
+    requirement = db.get(Requirement, link.requirement_id) if link.requirement_id else None
+    return _document_out(
+        document,
+        link,
+        editable=_requirement_editable(item, requirement),
+        counts_for_submission=submission.status == "DRAFT",
+    )
 
 
 def _load_link(db, principal: Principal, link_id: UUID):
@@ -409,20 +496,53 @@ def _load_link(db, principal: Principal, link_id: UUID):
 
 @router.get("/document-links/{link_id}", response_model=PortalDocumentOut)
 def get_document_link(link_id: UUID, db: DbSession, principal: PortalUser):
-    link, document, _, _ = _load_link(db, principal, link_id)
-    return _document_out(document, link)
+    link, document, submission, item = _load_link(db, principal, link_id)
+    requirement = db.get(Requirement, link.requirement_id) if link.requirement_id else None
+    return _document_out(
+        document,
+        link,
+        editable=_requirement_editable(item, requirement),
+        counts_for_submission=submission.status == "DRAFT",
+    )
 
 
 @router.delete("/document-links/{link_id}", response_model=PortalDocumentOut)
 def exclude_document(link_id: UUID, db: DbSession, principal: PortalUser):
     link, document, submission, item = _load_link(db, principal, link_id)
-    if submission.status != "DRAFT" or item.status not in ("OPEN", "CHANGES_REQUESTED"):
+    item = _load_request(db, principal, item.id, lock=True)
+    if item.status not in ("OPEN", "CHANGES_REQUESTED"):
         raise APIError(409, "SUBMISSION_READ_ONLY", "Submitted documents cannot be removed")
+    requirement = db.get(Requirement, link.requirement_id) if link.requirement_id else None
+    if not _requirement_editable(item, requirement):
+        raise APIError(
+            409, "SUBMISSION_READ_ONLY", "This requirement cannot be changed"
+        )
+    if submission.status != "DRAFT":
+        draft = _draft_submission(db, item, principal)
+        current = db.scalar(select(RequirementDocument).where(
+            RequirementDocument.submission_id == draft.id,
+            RequirementDocument.requirement_id == link.requirement_id,
+            RequirementDocument.document_id == document.id,
+        ))
+        if current is None:
+            current = RequirementDocument(
+                firm_id=item.firm_id,
+                request_id=item.id,
+                submission_id=draft.id,
+                requirement_id=link.requirement_id,
+                document_id=document.id,
+                document_type=link.document_type,
+                relation="REFERENCE",
+            )
+            db.add(current)
+        link = current
     if link.excluded_at is None:
         link.excluded_at = datetime.now(UTC)
         link.excluded_by = principal.user.id
         db.commit()
-    return _document_out(document, link)
+    return _document_out(
+        document, link, editable=True, counts_for_submission=True,
+    )
 
 
 @router.get("/document-links/{link_id}/download")
@@ -442,7 +562,12 @@ def download_document(link_id: UUID, db: DbSession, principal: PortalUser):
     "/collection-requests/{request_id}/submit",
     response_model=PortalCollectionDetailOut,
 )
-def submit_collection(request_id: UUID, db: DbSession, principal: PortalUser):
+def submit_collection(
+    request_id: UUID,
+    db: DbSession,
+    principal: PortalUser,
+    body: PortalSubmitInput | None = None,
+):
     item = _load_request(db, principal, request_id, lock=True)
     if item.status not in ("OPEN", "CHANGES_REQUESTED"):
         raise APIError(409, "INVALID_TRANSITION", "This request cannot be submitted")
@@ -456,12 +581,15 @@ def submit_collection(request_id: UUID, db: DbSession, principal: PortalUser):
     available_ids = {
         link.requirement_id for link, document in active if document.status == "AVAILABLE"
     }
-    missing = [str(requirement.id) for requirement in db.scalars(
+    requirements = list(db.scalars(
         select(Requirement).where(
             Requirement.request_id == item.id,
-            Requirement.required.is_(True),
         )
-    ) if requirement.id not in available_ids]
+    ))
+    missing = [str(requirement.id) for requirement in requirements
+               if requirement.required
+               and requirement.status not in ("SATISFIED", "WAIVED")
+               and requirement.id not in available_ids]
     if missing:
         raise APIError(
             422, "REQUIRED_DOCUMENTS_MISSING",
@@ -470,15 +598,24 @@ def submit_collection(request_id: UUID, db: DbSession, principal: PortalUser):
         )
     now = datetime.now(UTC)
     draft.status = "SUBMITTED"
+    draft.note = body.note or None if body else None
     draft.submitted_at = now
+    for requirement in requirements:
+        if (
+            requirement.id in available_ids
+            and requirement.status not in ("SATISFIED", "WAIVED")
+        ):
+            requirement.status = "RECEIVED"
     item.status = "IN_REVIEW"
     item.submitted_at = now
+    item.updated_at = now
     db.add(WorkflowEvent(
         firm_id=item.firm_id,
         request_id=item.id,
         actor_id=principal.user.id,
         event_type="SUBMITTED",
         payload={"round_no": draft.round_no},
+        created_at=now,
     ))
     db.commit()
     return _detail(db, item)

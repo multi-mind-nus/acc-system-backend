@@ -375,6 +375,7 @@ class Submission(Base):
     request_id: Mapped[UUID]
     round_no: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), default="DRAFT")
+    note: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -423,6 +424,7 @@ class RequirementDocument(Base):
         ),
         Index("ix_requirement_documents_submission", "submission_id"),
         Index("ix_requirement_documents_document", "document_id"),
+        CheckConstraint("relation IN ('SUPPORTS', 'CONTRADICTS', 'REFERENCE')"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -432,8 +434,49 @@ class RequirementDocument(Base):
     requirement_id: Mapped[UUID | None] = mapped_column(ForeignKey("requirements.id"))
     document_id: Mapped[UUID] = mapped_column(ForeignKey("documents.id"))
     document_type: Mapped[str] = mapped_column(String(64))
+    relation: Mapped[str] = mapped_column(String(16), default="SUPPORTS")
     excluded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     excluded_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ReviewDecision(Base):
+    __tablename__ = "review_decisions"
+    __table_args__ = (
+        CheckConstraint("decision IN ('SATISFY', 'REQUEST_ACTION', 'WAIVE')"),
+        CheckConstraint(
+            "issue_code IS NULL OR issue_code IN ('MISSING', 'WRONG_PERIOD', "
+            "'ENTITY_MISMATCH', 'UNREADABLE', 'INCOMPLETE', 'OTHER')"
+        ),
+        Index("ix_review_decisions_requirement", "requirement_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    requirement_id: Mapped[UUID] = mapped_column(ForeignKey("requirements.id"))
+    submission_id: Mapped[UUID] = mapped_column(ForeignKey("submissions.id"))
+    decision: Mapped[str] = mapped_column(String(24))
+    issue_code: Mapped[str | None] = mapped_column(String(32))
+    client_message: Mapped[str | None] = mapped_column(Text)
+    internal_note: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ReviewDecisionDocument(Base):
+    __tablename__ = "review_decision_documents"
+    __table_args__ = (
+        CheckConstraint("relation IN ('SUPPORTS', 'CONTRADICTS', 'REFERENCE')"),
+    )
+
+    decision_id: Mapped[UUID] = mapped_column(
+        ForeignKey("review_decisions.id"), primary_key=True
+    )
+    document_id: Mapped[UUID] = mapped_column(
+        ForeignKey("documents.id"), primary_key=True
+    )
+    relation: Mapped[str] = mapped_column(String(16))

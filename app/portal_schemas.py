@@ -16,6 +16,8 @@ class PortalDocumentOut(BaseModel):
     status: DocumentStatus
     failure_code: str | None
     duplicate: bool = False
+    editable: bool
+    counts_for_submission: bool
     created_at: datetime
 
 
@@ -34,6 +36,7 @@ class PortalSubmissionOut(BaseModel):
     id: UUID
     round_no: int
     status: Literal["DRAFT", "SUBMITTED"]
+    note: str | None
     submitted_at: datetime | None
     created_at: datetime
 
@@ -48,6 +51,7 @@ class PortalCollectionSummaryOut(BaseModel):
     assignee_name: str
     required_count: int
     ready_count: int
+    updated_at: datetime
 
 
 class PortalCollectionDetailOut(PortalCollectionSummaryOut):
@@ -64,6 +68,12 @@ class PortalCollectionListOut(BaseModel):
 class PortalUploadOut(BaseModel):
     submission_id: UUID
     document: PortalDocumentOut
+
+
+class PortalSubmitInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    note: str | None = Field(default=None, max_length=2000)
 
 
 class ClassificationFileInput(BaseModel):
