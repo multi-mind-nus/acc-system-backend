@@ -42,6 +42,7 @@ Run the full stack after copying the deployment environment file:
 cp deploy/.env.example deploy/.env.prod
 docker build -t acc-system-backend:local .
 docker build -t acc-system-nginx:local deploy/nginx
+docker build -t acc-system-agent:local ../acc-system-agent
 docker compose --env-file deploy/.env.prod -f deploy/compose.yml up -d
 ```
 

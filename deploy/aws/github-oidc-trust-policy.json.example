@@ -16,7 +16,9 @@
             "repo:multi-mind-nus@329084135/acc-system-backend@1369826563:ref:refs/heads/main",
             "repo:multi-mind-nus@329084135/acc-system-backend@1369826563:ref:refs/tags/v*",
             "repo:multi-mind-nus@329084135/acc-system-frontend@1369826229:ref:refs/heads/main",
-            "repo:multi-mind-nus@329084135/acc-system-frontend@1369826229:ref:refs/tags/v*"
+            "repo:multi-mind-nus@329084135/acc-system-frontend@1369826229:ref:refs/tags/v*",
+            "repo:multi-mind-nus@329084135/acc-system-agent@1369826820:ref:refs/heads/main",
+            "repo:multi-mind-nus@329084135/acc-system-agent@1369826820:ref:refs/tags/v*"
           ]
         }
       }

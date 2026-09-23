@@ -1,5 +1,6 @@
 from datetime import date, datetime
-from typing import Literal
+from decimal import Decimal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,6 +12,13 @@ CollectionStatus = Literal[
 RequirementStatus = Literal[
     "PENDING", "RECEIVED", "NEEDS_ACTION", "SATISFIED", "WAIVED",
 ]
+AIMode = Literal["OFF", "SUGGEST", "AUTO_REVIEW"]
+AIThreshold = Annotated[Decimal, Field(ge=Decimal("0.500"), le=Decimal("1.000"), max_digits=4, decimal_places=3)]
+AnalysisType = Literal["DOCUMENT_REQUIREMENT_VALIDATION", "BANK_TRANSACTION_RECONCILIATION"]
+
+
+def default_analysis_type(document_type: str) -> AnalysisType:
+    return "BANK_TRANSACTION_RECONCILIATION" if document_type == "BANK_STATEMENT" else "DOCUMENT_REQUIREMENT_VALIDATION"
 
 
 class RequirementInput(BaseModel):
@@ -29,6 +37,7 @@ class RequirementUpdate(RequirementInput):
 class RequirementOut(RequirementInput):
     model_config = ConfigDict(from_attributes=True)
 
+    analysis_type: AnalysisType
     id: UUID
     position: int
     origin: Literal["INITIAL", "FOLLOW_UP"]
@@ -44,6 +53,9 @@ class CollectionCreate(BaseModel):
     due_at: datetime
     scope_note: str | None = Field(default=None, max_length=4000)
     assignee_id: UUID | None = None
+    ai_mode: AIMode = "AUTO_REVIEW"
+    ai_satisfy_threshold: AIThreshold = Decimal("0.980")
+    ai_request_action_threshold: AIThreshold = Decimal("0.980")
     requirements: list[RequirementInput] = Field(min_length=1, max_length=100)
 
     @field_validator("period")
@@ -68,9 +80,15 @@ class CollectionUpdate(BaseModel):
     due_at: datetime | None = None
     scope_note: str | None = Field(default=None, max_length=4000)
     assignee_id: UUID | None = None
+    ai_mode: AIMode | None = None
+    ai_satisfy_threshold: AIThreshold | None = None
+    ai_request_action_threshold: AIThreshold | None = None
 
     @model_validator(mode="after")
     def require_change(self):
+        for field in ("ai_mode", "ai_satisfy_threshold", "ai_request_action_threshold"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
         if not (self.model_fields_set - {"version"}):
             raise ValueError("At least one field must be updated")
         if "due_at" in self.model_fields_set and self.due_at is None:
@@ -99,7 +117,8 @@ class CollectionSummaryOut(BaseModel):
 
 class WorkflowEventOut(BaseModel):
     id: UUID
-    actor_id: UUID
+    actor_id: UUID | None
+    actor_type: Literal["USER", "SYSTEM"] = "USER"
     actor_name: str
     event_type: str
     payload: dict
@@ -107,6 +126,9 @@ class WorkflowEventOut(BaseModel):
 
 
 class CollectionDetailOut(CollectionSummaryOut):
+    ai_mode: AIMode
+    ai_satisfy_threshold: AIThreshold
+    ai_request_action_threshold: AIThreshold
     requirements: list[RequirementOut]
     events: list[WorkflowEventOut]
 

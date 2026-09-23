@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -20,6 +21,10 @@ from app.models import (
     Requirement,
     User,
     WorkflowEvent,
+    AIRun,
+    NotificationOutbox,
+    ReviewDecision,
+    Submission,
 )
 
 
@@ -323,3 +328,122 @@ def test_copy_and_combined_filters_do_not_leak_tenants(records) -> None:
             "/api/v1/collection-requests", headers=headers,
             params={"period": "2026-10-01"},
         ).json()["total"] == 1
+
+
+def test_ai_policy_defaults_validation_copy_and_draft_guard(records):
+    with TestClient(app) as client:
+        headers = auth_headers(client, "admin@example.com", records["password"])
+        body = payload(records["first"], records["admin"])
+        created = client.post("/api/v1/collection-requests", headers=idempotent(headers, "ai-default"), json=body)
+        assert created.status_code == 201, created.text
+        item = created.json()
+        assert item["ai_mode"] == "AUTO_REVIEW"
+        assert Decimal(item["ai_satisfy_threshold"]) == Decimal("0.980")
+        assert Decimal(item["ai_request_action_threshold"]) == Decimal("0.980")
+        path = f"/api/v1/collection-requests/{item['id']}"
+        for changes in ({"ai_mode": "UNKNOWN"}, {"ai_mode": None}, {"ai_satisfy_threshold": "0.499"}, {"ai_request_action_threshold": "1.001"}, {"ai_satisfy_threshold": "NaN"}, {"ai_satisfy_threshold": "0.9999"}):
+            assert client.patch(path, headers=headers, json={"version": item["version"], **changes}).status_code == 422
+        updated = client.patch(path, headers=headers, json={"version": item["version"], "ai_mode": "SUGGEST", "ai_satisfy_threshold": "0.995"}).json()
+        copied = client.post(path + "/copy", params={"period": "2026-10-01"}, headers=idempotent(headers, "ai-copy-1"))
+        assert copied.status_code == 201, copied.text
+        assert copied.json()["ai_mode"] == "SUGGEST"
+        assert Decimal(copied.json()["ai_satisfy_threshold"]) == Decimal("0.995")
+        published = client.post(path + "/publish", headers=idempotent(headers, "ai-publish"), json={"version": updated["version"]})
+        assert published.status_code == 200, published.text
+        assert client.patch(path, headers=headers, json={"version": published.json()["version"], "ai_mode": "OFF"}).status_code == 409
+        # Analysis is internal: a bank statement needs no manually entered transaction.
+        body["period"] = "2026-11-01"
+        body["requirements"][0]["type"] = "BANK_STATEMENT"
+        result = client.post("/api/v1/collection-requests", headers=idempotent(headers, "automatic-analysis"), json=body)
+        assert result.status_code == 201, result.text
+        bank = result.json()["requirements"][0]
+        assert bank["analysis_type"] == "BANK_TRANSACTION_RECONCILIATION"
+        assert "target_transaction" not in bank["criteria"]
+        draft_path = f"/api/v1/collection-requests/{result.json()['id']}"
+        edited = client.patch(f"/api/v1/requirements/{bank['id']}", headers=headers, json={"version": bank["version"], "type": "RECEIPT", "title": "Receipts", "required": True, "criteria": {}})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["analysis_type"] == "DOCUMENT_REQUIREMENT_VALIDATION"
+        added = client.post(draft_path + "/requirements", headers=headers, json={"type": "BANK_STATEMENT", "title": "Bank statement"})
+        assert added.status_code == 201, added.text
+        assert added.json()["analysis_type"] == "BANK_TRANSACTION_RECONCILIATION"
+        legacy_target = {"date": "2026-11-02", "description": "Legacy payment", "amount": "-2828.80", "currency": "SGD"}
+        with SessionLocal.begin() as db:
+            legacy = db.get(Requirement, UUID(added.json()["id"]))
+            legacy.analysis_type = "DOCUMENT_REQUIREMENT_VALIDATION"
+            legacy.criteria = {"target_transaction": legacy_target, "period_note": "Keep this instruction"}
+        copied_draft = client.post(draft_path + "/copy", params={"period": "2026-12-01"}, headers=idempotent(headers, "copy-internal-analysis"))
+        assert copied_draft.status_code == 201, copied_draft.text
+        copied_bank = next(req for req in copied_draft.json()["requirements"] if req["title"] == "Bank statement")
+        assert copied_bank["analysis_type"] == "BANK_TRANSACTION_RECONCILIATION"
+        assert copied_bank["criteria"] == {"period_note": "Keep this instruction"}
+        with SessionLocal() as db:
+            assert db.get(Requirement, UUID(added.json()["id"])).criteria["target_transaction"] == legacy_target
+        body["period"] = "2026-12-01"
+        body["requirements"][0]["analysis_type"] = "DOCUMENT_REQUIREMENT_VALIDATION"
+        assert client.post("/api/v1/collection-requests", headers=idempotent(headers, "client-analysis-override"), json=body).status_code == 422
+        with SessionLocal() as db:
+            assert db.scalar(select(func.count(AIRun.id))) == 0
+            assert db.scalar(select(func.count(NotificationOutbox.id))) == 0
+
+
+def test_ai_audit_constraints_and_system_events(records):
+    from sqlalchemy.exc import IntegrityError
+    from uuid import uuid4
+
+    with TestClient(app) as client:
+        headers = auth_headers(client, "admin@example.com", records["password"])
+        created = client.post("/api/v1/collection-requests", headers=idempotent(headers, "ai-audit-create"), json=payload(records["first"], records["admin"])).json()
+        request_id = UUID(created["id"])
+        requirement_id = UUID(created["requirements"][0]["id"])
+        with SessionLocal.begin() as db:
+            submission = Submission(firm_id=records["firm_id"], request_id=request_id, round_no=1, status="SUBMITTED", created_by=records["admin"])
+            db.add(submission)
+            db.flush()
+            run = AIRun(firm_id=records["firm_id"], request_id=request_id, submission_id=submission.id, purpose="REVIEW", requested_by=records["admin"])
+            db.add(run)
+            db.flush()
+            values = dict(firm_id=records["firm_id"], requirement_id=requirement_id, submission_id=submission.id, source="AI", ai_run_id=run.id, decision="SATISFY")
+            db.add(ReviewDecision(**values))
+            db.add(WorkflowEvent(firm_id=records["firm_id"], request_id=request_id, actor_type="SYSTEM", event_type="AI_REVIEWED", payload={}))
+            db.flush()
+            for invalid in (ReviewDecision(**values), ReviewDecision(**{**values, "decision": "WAIVE"}), AIRun(firm_id=uuid4(), request_id=request_id, purpose="CLASSIFY"), AIRun(firm_id=records["firm_id"], request_id=request_id, purpose="REVIEW"), WorkflowEvent(firm_id=records["firm_id"], request_id=request_id, actor_type="USER", event_type="INVALID")):
+                with pytest.raises(IntegrityError), db.begin_nested():
+                    db.add(invalid)
+                    db.flush()
+            outbox = NotificationOutbox(firm_id=records["firm_id"], request_id=request_id, recipient="client@example.com", template="CHANGES_REQUESTED", dedupe_key="review:1:client")
+            db.add(outbox)
+            db.flush()
+            assert outbox.status == "SUPPRESSED" and outbox.last_error == "PROVIDER_DISABLED"
+            with pytest.raises(IntegrityError), db.begin_nested():
+                db.add(NotificationOutbox(firm_id=records["firm_id"], request_id=request_id, recipient="client@example.com", template="CHANGES_REQUESTED", dedupe_key="review:1:client"))
+                db.flush()
+        events = client.get(f"/api/v1/collection-requests/{request_id}/events", headers=headers).json()
+        system = next(event for event in events if event["actor_type"] == "SYSTEM")
+        assert system["actor_id"] is None and system["actor_name"] == "System"
+        review = client.get(f"/api/v1/collection-requests/{request_id}/review", headers=headers)
+        assert review.status_code == 200, review.text
+        decision = review.json()["requirements"][0]["decisions"][0]
+        assert decision["source"] == "AI" and decision["created_by"] is None
+
+
+def test_ai_migration_preserves_existing_requests_as_suggest(records):
+    from alembic import command
+    from alembic.config import Config
+
+    with TestClient(app) as client:
+        headers = auth_headers(client, "admin@example.com", records["password"])
+        created = client.post("/api/v1/collection-requests", headers=idempotent(headers, "migration-old-request"), json=payload(records["first"], records["admin"])).json()
+        config = Config("alembic.ini")
+        try:
+            command.downgrade(config, "0008_submission_notes")
+        finally:
+            command.upgrade(config, "head")
+        migrated = client.get(f"/api/v1/collection-requests/{created['id']}", headers=headers).json()
+        assert migrated["ai_mode"] == "SUGGEST"
+        assert migrated["status"] == created["status"]
+        assert migrated["version"] == created["version"]
+        assert len(migrated["requirements"]) == len(created["requirements"])
+        assert migrated["events"] == created["events"]
+        fresh = client.post("/api/v1/collection-requests", headers=idempotent(headers, "migration-new-request"), json=payload(records["first"], records["admin"], "2026-10-01"))
+        assert fresh.status_code == 201, fresh.text
+        assert fresh.json()["ai_mode"] == "AUTO_REVIEW"

@@ -5,6 +5,8 @@ x-backend-environment: &backend-environment
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
   REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
   WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-10}
+  AGENT_URL: ${AGENT_URL:-http://agent:8000}
+  AGENT_CLASSIFICATION_PROVIDER: ${AGENT_CLASSIFICATION_PROVIDER:-DISABLED}
   MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
   CLAMAV_HOST: ${CLAMAV_HOST:-}
   CLAMAV_PORT: ${CLAMAV_PORT:-3310}
@@ -15,6 +17,30 @@ x-backend-environment: &backend-environment
   FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost}
 
 services:
+  agent:
+    image: ${AGENT_IMAGE:-acc-system-agent:local}
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      CLASSIFICATION_PROVIDER: ${AGENT_CLASSIFICATION_PROVIDER:-DISABLED}
+      REVIEW_PROVIDER: ${AGENT_REVIEW_PROVIDER:-DISABLED}
+      DOCUMENT_PATH: /data/documents
+      MAX_DOCUMENT_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
+      MODEL_API_URL: ${MODEL_API_URL:-}
+      MODEL_HEALTH_URL: ${MODEL_HEALTH_URL:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_CONNECT_TIMEOUT_SECONDS: ${MODEL_CONNECT_TIMEOUT_SECONDS:-10}
+      MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-180}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    volumes:
+      - documents:/data/documents:ro
+    networks:
+      - internal
+
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:17.6-alpine}
     environment:

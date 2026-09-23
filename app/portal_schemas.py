@@ -58,6 +58,7 @@ class PortalCollectionDetailOut(PortalCollectionSummaryOut):
     scope_note: str | None
     requirements: list[PortalRequirementOut]
     submission: PortalSubmissionOut | None
+    review_status: Literal["PROCESSING", "AWAITING_ACCOUNTANT"] | None = None
 
 
 class PortalCollectionListOut(BaseModel):
@@ -74,27 +75,3 @@ class PortalSubmitInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     note: str | None = Field(default=None, max_length=2000)
-
-
-class ClassificationFileInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    name: str = Field(min_length=1, max_length=255)
-    content_type: str = Field(min_length=1, max_length=100)
-    size_bytes: int = Field(ge=0)
-
-
-class ClassificationRequest(BaseModel):
-    files: list[ClassificationFileInput] = Field(min_length=1, max_length=100)
-
-
-class ClassificationItemOut(BaseModel):
-    index: int
-    category: Literal["REQUIREMENT", "OTHER", "INVALID"]
-    requirement_id: UUID | None
-    confidence: float
-
-
-class ClassificationOut(BaseModel):
-    provider: Literal["FAKE"] = "FAKE"
-    items: list[ClassificationItemOut]

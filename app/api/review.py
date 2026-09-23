@@ -19,6 +19,7 @@ from app.auth import Principal, ensure_client_access, require_firm_role
 from app.db import DbSession
 from app.errors import APIError
 from app.models import (
+    AIRun,
     Client,
     CollectionRequest,
     Document,
@@ -31,6 +32,7 @@ from app.models import (
     WorkflowEvent,
 )
 from app.review_schemas import (
+    ReviewRunOut,
     ApprovalInput,
     EvidenceInput,
     RequirementReviewInput,
@@ -46,6 +48,47 @@ router = APIRouter(prefix="/api/v1")
 Staff = Annotated[
     Principal, Depends(require_firm_role("FIRM_ADMIN", "ACCOUNTANT"))
 ]
+
+
+def _run_out(db, item, run):
+    from app.review_analysis import authorized_documents
+    refs = run.input_snapshot.get("request", {}).get("documents", [])
+    documents = authorized_documents(db, item, [UUID(ref["document_id"]) for ref in refs])
+    return ReviewRunOut(
+        id=run.id, submission_id=run.submission_id, status=run.status, model_version=run.model_version,
+        error=run.error, created_at=run.created_at, finished_at=run.finished_at, output=run.output,
+        documents=[{"id": str(doc.id), "name": doc.original_name, "content_type": doc.content_type, "scope": ref["scope"]} for ref in refs if (doc := documents.get(UUID(ref["document_id"])))],
+        searches=run.input_snapshot.get("search_results", []),
+    )
+
+
+@router.get("/collection-requests/{request_id}/review-runs", response_model=list[ReviewRunOut])
+def get_review_runs(request_id: UUID, db: DbSession, principal: Staff):
+    item = _load_request(db, principal, request_id)
+    runs = db.scalars(select(AIRun).where(AIRun.request_id == item.id, AIRun.firm_id == item.firm_id, AIRun.purpose == "REVIEW").order_by(AIRun.created_at.desc(), AIRun.id))
+    return [_run_out(db, item, run) for run in runs]
+
+
+@router.post("/collection-requests/{request_id}/review-runs/{run_id}/retry", response_model=ReviewRunOut)
+def retry_review(request_id: UUID, run_id: UUID, db: DbSession, principal: Staff):
+    from app.review_analysis import enqueue_review
+    item = _load_request(db, principal, request_id, lock=True)
+    run = db.scalar(select(AIRun).where(AIRun.id == run_id, AIRun.request_id == item.id, AIRun.purpose == "REVIEW"))
+    if run is None:
+        raise APIError(404, "AI_RUN_NOT_FOUND", "Review not found")
+    submission = db.scalar(select(Submission).where(Submission.request_id == item.id, Submission.status == "SUBMITTED").order_by(Submission.round_no.desc()).limit(1))
+    if item.status != "IN_REVIEW" or item.ai_mode == "OFF" or submission.id != run.submission_id:
+        raise APIError(409, "INVALID_TRANSITION", "Only the current submission can be analyzed")
+    latest = db.scalar(select(AIRun).where(AIRun.submission_id == submission.id, AIRun.purpose == "REVIEW").order_by(AIRun.created_at.desc()).limit(1))
+    if latest.status in ("QUEUED", "PROCESSING") or latest.id != run.id:
+        return _run_out(db, item, latest)
+    if run.status != "FAILED":
+        raise APIError(409, "INVALID_TRANSITION", "Only failed reviews can be retried")
+    new_run = enqueue_review(db, item, submission, principal.user.id)
+    db.flush()
+    result = _run_out(db, item, new_run)
+    db.commit()
+    return result
 
 
 def _event(db, principal: Principal, item: CollectionRequest, kind: str, payload=None):
@@ -109,7 +152,7 @@ def _review_detail(db, item: CollectionRequest) -> ReviewCollectionOut:
     decisions: dict[UUID, list[ReviewDecisionOut]] = {}
     decision_rows = db.execute(
         select(ReviewDecision, User.name)
-        .join(User, User.id == ReviewDecision.created_by)
+        .outerjoin(User, User.id == ReviewDecision.created_by)
         .where(ReviewDecision.requirement_id.in_([value.id for value in requirements]))
         .order_by(ReviewDecision.created_at.desc())
     ).all() if requirements else []
@@ -132,7 +175,9 @@ def _review_detail(db, item: CollectionRequest) -> ReviewCollectionOut:
             client_message=decision.client_message,
             internal_note=decision.internal_note,
             created_by=decision.created_by,
-            created_by_name=creator_name,
+            source=decision.source,
+            ai_run_id=decision.ai_run_id,
+            created_by_name=creator_name or "System",
             created_at=decision.created_at,
             evidence=evidence.get(decision.id, []),
         ))
@@ -170,6 +215,13 @@ def _review_detail(db, item: CollectionRequest) -> ReviewCollectionOut:
 def _check_request_version(item: CollectionRequest, version: int, db) -> None:
     if item.version != version:
         raise APIError(409, "VERSION_CONFLICT", "Request has changed", _review_detail(db, item))
+
+
+def _unreviewed_requirements(db, item: CollectionRequest) -> list[UUID]:
+    return list(db.scalars(select(Requirement.id).where(
+        Requirement.request_id == item.id,
+        Requirement.status.not_in(("NEEDS_ACTION", "SATISFIED", "WAIVED")),
+    )))
 
 
 def _finish(db, record, item: CollectionRequest) -> ReviewCollectionOut:
@@ -292,6 +344,11 @@ def request_changes(
     _check_request_version(item, body.version, db)
     if item.status != "IN_REVIEW":
         raise APIError(409, "INVALID_TRANSITION", "Only a request in review can be returned")
+    unreviewed = _unreviewed_requirements(db, item)
+    if unreviewed:
+        raise APIError(422, "REVIEW_INCOMPLETE", "Review every requirement before continuing", {
+            "requirement_ids": [str(value) for value in unreviewed]
+        })
     if not db.scalar(select(Requirement.id).where(
         Requirement.request_id == item.id,
         Requirement.status == "NEEDS_ACTION",
@@ -321,7 +378,6 @@ def approve(
         raise APIError(409, "INVALID_TRANSITION", "Only a request in review can be approved")
     incomplete = list(db.scalars(select(Requirement.id).where(
         Requirement.request_id == item.id,
-        Requirement.required.is_(True),
         Requirement.status.not_in(("SATISFIED", "WAIVED")),
     )))
     if incomplete:

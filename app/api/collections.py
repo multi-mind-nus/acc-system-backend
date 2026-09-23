@@ -24,6 +24,7 @@ from app.collection_schemas import (
     RequirementUpdate,
     VersionRequest,
     WorkflowEventOut,
+    default_analysis_type,
 )
 from app.db import DbSession
 from app.errors import APIError
@@ -77,14 +78,15 @@ def _requirements(db, request_id: UUID) -> list[Requirement]:
 def _events(db, request_id: UUID) -> list[WorkflowEventOut]:
     rows = db.execute(
         select(WorkflowEvent, User.name)
-        .join(User, User.id == WorkflowEvent.actor_id)
+        .outerjoin(User, User.id == WorkflowEvent.actor_id)
         .where(WorkflowEvent.request_id == request_id)
         .order_by(WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc())
     ).all()
     return [WorkflowEventOut(
         id=event.id,
         actor_id=event.actor_id,
-        actor_name=actor_name,
+        actor_type=event.actor_type,
+        actor_name=actor_name or "System",
         event_type=event.event_type,
         payload=event.payload,
         created_at=event.created_at,
@@ -116,6 +118,9 @@ def _detail(db, item: CollectionRequest) -> CollectionDetailOut:
     assignee = db.get(User, item.assignee_id)
     requirements = _requirements(db, item.id)
     return CollectionDetailOut(
+        ai_mode=item.ai_mode,
+        ai_satisfy_threshold=item.ai_satisfy_threshold,
+        ai_request_action_threshold=item.ai_request_action_threshold,
         **_summary(
             item, client.legal_name, assignee.name, len(requirements)
         ).model_dump(),
@@ -124,6 +129,7 @@ def _detail(db, item: CollectionRequest) -> CollectionDetailOut:
             "origin": requirement.origin,
             "position": requirement.position,
             "type": requirement.type,
+            "analysis_type": requirement.analysis_type,
             "title": requirement.title,
             "required": requirement.required,
             "criteria": requirement.criteria,
@@ -351,6 +357,9 @@ def create_collection(
         period=body.period,
         due_at=body.due_at,
         scope_note=body.scope_note,
+        ai_mode=body.ai_mode,
+        ai_satisfy_threshold=body.ai_satisfy_threshold,
+        ai_request_action_threshold=body.ai_request_action_threshold,
         created_by=principal.user.id,
         assignee_id=assignee_id,
     )
@@ -361,6 +370,7 @@ def create_collection(
         request_id=item.id,
         position=position,
         type=requirement.type,
+        analysis_type=default_analysis_type(requirement.type),
         title=requirement.title,
         required=requirement.required,
         criteria=requirement.criteria,
@@ -495,6 +505,9 @@ def copy_collection(
         period=period,
         due_at=_shift_due_at(source.due_at, month_delta),
         scope_note=source.scope_note,
+        ai_mode=source.ai_mode,
+        ai_satisfy_threshold=source.ai_satisfy_threshold,
+        ai_request_action_threshold=source.ai_request_action_threshold,
         created_by=principal.user.id,
         assignee_id=assignee_id,
     )
@@ -509,9 +522,10 @@ def copy_collection(
         request_id=item.id,
         position=requirement.position,
         type=requirement.type,
+        analysis_type=default_analysis_type(requirement.type),
         title=requirement.title,
         required=requirement.required,
-        criteria=requirement.criteria,
+        criteria={key: value for key, value in requirement.criteria.items() if key != "target_transaction"},
     ) for requirement in source_requirements])
     _event(db, principal, item.id, "COPIED", {"source_request_id": str(source.id)})
     db.flush()
@@ -533,6 +547,7 @@ def add_requirement(
         firm_id=principal.firm.id,
         request_id=item.id,
         origin="FOLLOW_UP" if follow_up else "INITIAL",
+        analysis_type=default_analysis_type(body.type),
         position=db.scalar(select(func.coalesce(func.max(Requirement.position), -1)).where(
             Requirement.request_id == item.id
         )) + 1,
@@ -580,6 +595,7 @@ def update_requirement(
         raise APIError(409, "VERSION_CONFLICT", "Requirement has changed")
     for field, value in body.model_dump(exclude={"version"}).items():
         setattr(requirement, field, value)
+    requirement.analysis_type = default_analysis_type(body.type)
     _event(db, principal, item.id, "REQUIREMENT_UPDATED", {"requirement_id": str(requirement.id)})
     db.commit()
     return requirement

@@ -13,6 +13,8 @@ from uuid import uuid4
 from sqlalchemy import or_, select
 
 from app.config import settings
+from app.classification_worker import process_classification
+from app.review_analysis import process_review
 from app.db import SessionLocal, dependency_status
 from app.logging_config import configure_logging
 from app.models import Document, Requirement, RequirementDocument
@@ -157,6 +159,10 @@ def main() -> None:
 
     while not stop_event.is_set():
         if process_next_document():
+            continue
+        if process_classification():
+            continue
+        if process_review():
             continue
         status = dependency_status()
         log = logger.info if all(value == "ok" for value in status.values()) else logger.error

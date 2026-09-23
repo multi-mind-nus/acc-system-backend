@@ -12,11 +12,13 @@ from sqlalchemy import func, select
 
 from app.auth import Principal, current_principal, ensure_client_access
 from app.collection_schemas import CollectionStatus
+from app.classification_schemas import StagedUploadOut
 from app.config import settings
 from app.db import DbSession
 from app.errors import APIError
 from app.models import (
     Client,
+    AIRun,
     CollectionRequest,
     Document,
     Requirement,
@@ -26,9 +28,6 @@ from app.models import (
     WorkflowEvent,
 )
 from app.portal_schemas import (
-    ClassificationItemOut,
-    ClassificationOut,
-    ClassificationRequest,
     PortalCollectionDetailOut,
     PortalCollectionListOut,
     PortalCollectionSummaryOut,
@@ -47,14 +46,6 @@ ALLOWED_FILES = {
     ".png": ("image/png", b"\x89PNG\r\n\x1a\n"),
     ".jpg": ("image/jpeg", b"\xff\xd8\xff"),
     ".jpeg": ("image/jpeg", b"\xff\xd8\xff"),
-}
-TYPE_KEYWORDS = {
-    "BANK_STATEMENT": ("bank", "statement", "对账单", "流水"),
-    "SALES_INVOICE": ("sales", "invoice", "销售", "发票"),
-    "PURCHASE_INVOICE": ("purchase", "supplier", "vendor", "采购", "供应商", "发票"),
-    "RECEIPT": ("receipt", "收据", "小票"),
-    "PAYMENT_PLATFORM_REPORT": ("stripe", "paypal", "settlement", "平台", "结算"),
-    "LOAN_STATEMENT": ("loan", "贷款"),
 }
 
 
@@ -159,8 +150,26 @@ def _requirement_editable(
     return item.status == "OPEN" or (
         item.status == "CHANGES_REQUESTED"
         and requirement is not None
-        and requirement.status == "NEEDS_ACTION"
+        and requirement.status in ("PENDING", "RECEIVED", "NEEDS_ACTION")
     )
+
+
+def _carry_unreviewed_documents(db, item, draft, requirements):
+    if item.status != "CHANGES_REQUESTED":
+        return
+    carry_ids = {value.id for value in requirements if value.status in ("PENDING", "RECEIVED")}
+    current = {(link.requirement_id, document.id) for link, document in _links(db, draft.id) if not link.excluded_at}
+    for link, document, submission in _effective_links(db, item.id):
+        key = (link.requirement_id, document.id)
+        if submission.id == draft.id or link.requirement_id not in carry_ids or link.excluded_at or document.status != "AVAILABLE" or key in current:
+            continue
+        db.add(RequirementDocument(
+            firm_id=item.firm_id, request_id=item.id, submission_id=draft.id,
+            requirement_id=link.requirement_id, document_id=document.id,
+            document_type=link.document_type, relation=link.relation,
+        ))
+        current.add(key)
+    db.flush()
 
 
 def _summary(db, item: CollectionRequest) -> PortalCollectionSummaryOut:
@@ -216,9 +225,11 @@ def _detail(db, item: CollectionRequest) -> PortalCollectionDetailOut:
             counts_for_submission=link.submission_id == current_draft_id,
         ))
     summary = _summary(db, item)
+    review_run = db.scalar(select(AIRun).where(AIRun.request_id == item.id, AIRun.submission_id == latest.id, AIRun.purpose == "REVIEW").order_by(AIRun.created_at.desc()).limit(1)) if latest and latest.status == "SUBMITTED" else None
     return PortalCollectionDetailOut(
         **summary.model_dump(),
         scope_note=item.scope_note,
+        review_status=("PROCESSING" if review_run and review_run.status in ("QUEUED", "PROCESSING") else "AWAITING_ACCOUNTANT") if item.status == "IN_REVIEW" else None,
         requirements=[PortalRequirementOut(
             id=requirement.id,
             type=requirement.type,
@@ -278,45 +289,6 @@ def get_collection(request_id: UUID, db: DbSession, principal: PortalUser):
     return _detail(db, _load_request(db, principal, request_id))
 
 
-@router.post(
-    "/collection-requests/{request_id}/classify",
-    response_model=ClassificationOut,
-)
-def classify_documents(
-    request_id: UUID,
-    body: ClassificationRequest,
-    db: DbSession,
-    principal: PortalUser,
-):
-    item = _load_request(db, principal, request_id)
-    if item.status not in ("OPEN", "CHANGES_REQUESTED"):
-        raise APIError(409, "SUBMISSION_READ_ONLY", "This submission can no longer be changed")
-    requirements = [requirement for requirement in db.scalars(
-        select(Requirement).where(Requirement.request_id == item.id).order_by(Requirement.position)
-    ) if _requirement_editable(item, requirement)]
-    results = []
-    for index, file in enumerate(body.files):
-        name = file.name.casefold()
-        expected = ALLOWED_FILES.get(Path(name).suffix)
-        invalid = (
-            file.size_bytes == 0
-            or file.size_bytes > settings.max_upload_bytes
-            or expected is None
-            or file.content_type != expected[0]
-        )
-        match = None if invalid else next((requirement for requirement in requirements if any(
-            keyword in name for keyword in TYPE_KEYWORDS.get(requirement.type, ())
-        )), None)
-        # ponytail: deterministic placeholder; replace this endpoint body when an AI provider is connected.
-        results.append(ClassificationItemOut(
-            index=index,
-            category="INVALID" if invalid else "REQUIREMENT" if match else "OTHER",
-            requirement_id=match.id if match else None,
-            confidence=0.99 if invalid else 0.9 if match else 0.55,
-        ))
-    return ClassificationOut(items=results)
-
-
 def _validate_file(name: str, content_type: str | None, header: bytes) -> tuple[str, str]:
     extension = Path(name).suffix.lower()
     expected = ALLOWED_FILES.get(extension)
@@ -330,7 +302,7 @@ def _validate_file(name: str, content_type: str | None, header: bytes) -> tuple[
 
 @router.post(
     "/collection-requests/{request_id}/documents",
-    response_model=PortalUploadOut,
+    response_model=PortalUploadOut | StagedUploadOut,
     status_code=202,
 )
 async def upload_document(
@@ -339,10 +311,24 @@ async def upload_document(
     principal: PortalUser,
     file: Annotated[UploadFile, File()],
     requirement_id: Annotated[UUID | None, Form()] = None,
+    classification_run_id: Annotated[UUID | None, Form()] = None,
 ):
     item = _load_request(db, principal, request_id, lock=True)
     if item.status not in ("OPEN", "CHANGES_REQUESTED"):
         raise APIError(409, "SUBMISSION_READ_ONLY", "This submission can no longer be changed")
+    run = None
+    if classification_run_id:
+        run = db.scalar(select(AIRun).where(
+            AIRun.id == classification_run_id, AIRun.request_id == item.id,
+            AIRun.firm_id == item.firm_id, AIRun.requested_by == principal.user.id,
+            AIRun.purpose == "CLASSIFY",
+        ).with_for_update())
+        if run is None:
+            raise APIError(404, "CLASSIFICATION_NOT_FOUND", "Classification session not found")
+        if run.status != "DRAFT" or run.confirmed_at or requirement_id:
+            raise APIError(409, "CLASSIFICATION_NOT_EDITABLE", "Classification session cannot be changed")
+        if len(run.input_snapshot.get("documents", [])) >= 100:
+            raise APIError(422, "TOO_MANY_FILES", "Select at most 100 files")
     requirement = None
     if requirement_id:
         requirement = db.scalar(select(Requirement).where(
@@ -351,7 +337,7 @@ async def upload_document(
         ))
         if requirement is None:
             raise APIError(404, "REQUIREMENT_NOT_FOUND", "Requirement not found")
-    if not _requirement_editable(item, requirement):
+    if not run and not _requirement_editable(item, requirement):
         raise APIError(
             409, "SUBMISSION_READ_ONLY", "This requirement cannot be changed"
         )
@@ -375,7 +361,6 @@ async def upload_document(
         if size == 0:
             raise APIError(422, "FILE_EMPTY", "The file is empty")
         _, content_type = _validate_file(file.filename or "", file.content_type, header)
-        draft = _draft_submission(db, item, principal)
         existing = db.scalar(select(Document).where(
             Document.firm_id == item.firm_id,
             Document.client_id == item.client_id,
@@ -384,6 +369,9 @@ async def upload_document(
         ).order_by(Document.created_at))
         if existing:
             quarantine_path.unlink(missing_ok=True)
+            if run:
+                return _stage_document(db, run, existing)
+            draft = _draft_submission(db, item, principal)
             link = db.scalar(select(RequirementDocument).where(
                 RequirementDocument.submission_id == draft.id,
                 RequirementDocument.requirement_id == requirement_id,
@@ -419,6 +407,9 @@ async def upload_document(
         )
         db.add(document)
         db.flush()
+        if run:
+            return _stage_document(db, run, document)
+        draft = _draft_submission(db, item, principal)
         link = RequirementDocument(
             firm_id=item.firm_id, request_id=item.id, submission_id=draft.id,
             requirement_id=requirement_id, document_id=document.id,
@@ -437,6 +428,15 @@ async def upload_document(
         raise
     finally:
         await file.close()
+
+
+def _stage_document(db, run: AIRun, document: Document):
+    documents = list(run.input_snapshot.get("documents", []))
+    if not any(value["document_id"] == str(document.id) for value in documents):
+        documents.append({"document_id": str(document.id)})
+    run.input_snapshot = {**run.input_snapshot, "documents": documents}
+    db.commit()
+    return StagedUploadOut(document_id=document.id)
 
 
 def _load_document_link(db, principal: Principal, document_id: UUID):
@@ -574,6 +574,12 @@ def submit_collection(
     draft = _submission(db, item.id, "DRAFT")
     if draft is None:
         raise APIError(422, "REQUIRED_DOCUMENTS_MISSING", "Upload the required documents")
+    requirements = list(db.scalars(
+        select(Requirement).where(
+            Requirement.request_id == item.id,
+        )
+    ))
+    _carry_unreviewed_documents(db, item, draft, requirements)
     rows = _links(db, draft.id)
     active = [(link, document) for link, document in rows if not link.excluded_at]
     if any(document.status == "QUARANTINED" for _, document in active):
@@ -581,11 +587,6 @@ def submit_collection(
     available_ids = {
         link.requirement_id for link, document in active if document.status == "AVAILABLE"
     }
-    requirements = list(db.scalars(
-        select(Requirement).where(
-            Requirement.request_id == item.id,
-        )
-    ))
     missing = [str(requirement.id) for requirement in requirements
                if requirement.required
                and requirement.status not in ("SATISFIED", "WAIVED")
@@ -609,6 +610,8 @@ def submit_collection(
     item.status = "IN_REVIEW"
     item.submitted_at = now
     item.updated_at = now
+    from app.review_analysis import enqueue_review
+    enqueue_review(db, item, draft, principal.user.id)
     db.add(WorkflowEvent(
         firm_id=item.firm_id,
         request_id=item.id,

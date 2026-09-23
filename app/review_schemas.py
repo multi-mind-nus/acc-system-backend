@@ -71,7 +71,9 @@ class ReviewDecisionOut(BaseModel):
     issue_code: IssueCode | None
     client_message: str | None
     internal_note: str | None
-    created_by: UUID
+    created_by: UUID | None
+    source: Literal["HUMAN", "AI"] = "HUMAN"
+    ai_run_id: UUID | None = None
     created_by_name: str
     created_at: datetime
     evidence: list[EvidenceInput]
@@ -111,3 +113,16 @@ class ReviewCollectionOut(BaseModel):
     other_documents: list[ReviewDocumentOut]
     submissions: list[ReviewSubmissionOut]
     events: list[WorkflowEventOut]
+
+
+class ReviewRunOut(BaseModel):
+    id: UUID
+    submission_id: UUID
+    status: str
+    model_version: str | None
+    error: str | None
+    created_at: datetime
+    finished_at: datetime | None
+    output: dict | None
+    documents: list[dict]
+    searches: list[dict]

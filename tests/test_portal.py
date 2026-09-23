@@ -218,6 +218,46 @@ def test_upload_scan_duplicate_exclude_and_submit(records, monkeypatch):
         ).status_code == 409
 
 
+def test_legacy_unreviewed_material_is_editable_and_carried_forward(records):
+    with TestClient(app) as client:
+        portal = auth_headers(client, "client@example.com", records["password"])
+        initial = upload(client, portal, records["request"], records["required"])
+        assert initial.status_code == 202 and process_next_document()
+        submitted = client.post(
+            f"/api/v1/portal/collection-requests/{records['request']}/submit",
+            headers=portal,
+        )
+        assert submitted.status_code == 200
+        with SessionLocal.begin() as db:
+            db.get(CollectionRequest, records["request"]).status = "CHANGES_REQUESTED"
+            db.get(Requirement, records["required"]).status = "RECEIVED"
+            db.get(Requirement, records["optional"]).status = "NEEDS_ACTION"
+
+        correction = upload(
+            client, portal, records["request"], records["optional"],
+            b"%PDF-1.7\ncorrected receipt",
+        )
+        assert correction.status_code == 202 and process_next_document()
+        waiting = client.get(
+            f"/api/v1/portal/collection-requests/{records['request']}", headers=portal
+        ).json()
+        original = next(value for value in waiting["requirements"] if value["id"] == str(records["required"]))
+        assert original["documents"][0]["editable"] is True
+
+        resubmitted = client.post(
+            f"/api/v1/portal/collection-requests/{records['request']}/submit",
+            headers=portal,
+        )
+        assert resubmitted.status_code == 200, resubmitted.text
+        latest_submission = resubmitted.json()["submission"]["id"]
+        admin = auth_headers(client, "admin@example.com", records["password"])
+        review = client.get(
+            f"/api/v1/collection-requests/{records['request']}/review", headers=admin
+        ).json()
+        carried = next(value for value in review["requirements"] if value["id"] == str(records["required"]))
+        assert [value["id"] for value in carried["documents"] if value["submission_id"] == latest_submission] == [initial.json()["document"]["id"]]
+
+
 def test_validation_malware_and_tenant_hiding(records):
     with TestClient(app) as client:
         headers = auth_headers(client, "client@example.com", records["password"])
@@ -253,34 +293,103 @@ def test_validation_malware_and_tenant_hiding(records):
         ).status_code == 404
 
 
-def test_fake_classification_matches_filename_to_requirement(records):
+def test_staged_classification_confirm_cancel_and_manual_fallback(records, monkeypatch):
+    from uuid import UUID
+    from app.classification_worker import process_classification
+    from app.models import AIRun
+
+    monkeypatch.setattr(settings, "agent_classification_provider", "MANUAL")
+    base = f"/api/v1/portal/collection-requests/{records['request']}"
     with TestClient(app) as client:
         headers = auth_headers(client, "client@example.com", records["password"])
-        payload = {"files": [
-            {"name": "september-bank-statement.pdf", "content_type": "application/pdf", "size_bytes": 42},
-            {"name": "misc.png", "content_type": "image/png", "size_bytes": 12},
-            {"name": "notes.txt", "content_type": "text/plain", "size_bytes": 8},
-        ]}
-        response = client.post(
-            f"/api/v1/portal/collection-requests/{records['request']}/classify",
-            headers=headers,
-            json=payload,
-        )
-        assert response.status_code == 200, response.text
-        assert response.json() == {
-            "provider": "FAKE",
-            "items": [
-                {"index": 0, "category": "REQUIREMENT", "requirement_id": str(records["required"]), "confidence": 0.9},
-                {"index": 1, "category": "OTHER", "requirement_id": None, "confidence": 0.55},
-                {"index": 2, "category": "INVALID", "requirement_id": None, "confidence": 0.99},
-            ],
-        }
+        run = client.post(base + "/classification-runs", headers=headers).json()
+        path = base + "/classification-runs/" + run["id"]
+        response = client.post(base + "/documents", headers=headers, data={"classification_run_id": run["id"]}, files={"file": ("statement.pdf", b"%PDF-1.7\nbank", "application/pdf")})
+        assert response.status_code == 202, response.text
+        doc_id = response.json()["document_id"]
+        choice = {"items": [{"document_id": doc_id, "category": "REQUIREMENT", "requirement_id": str(records['required'])}]}
+        assert client.get(base, headers=headers).json()["submission"] is None
+        assert client.post(path + "/confirm", headers=headers, json=choice).status_code == 409
+        assert client.post(path + "/start", headers=headers).json()["status"] == "QUEUED"
+        assert not process_classification()  # Not before scanning.
+        assert process_next_document()
+        with SessionLocal.begin() as db:
+            db.get(AIRun, UUID(run["id"])).next_attempt_at = None
+        assert process_classification()
+        classified = client.get(path, headers=headers).json()
+        assert classified["status"] == "SUCCEEDED"
+        assert classified["items"][0]["category"] == "OTHER"
+        assert "storage_key" not in str(classified) and "input_snapshot" not in classified
+        assert not any(req["documents"] for req in client.get(base, headers=headers).json()["requirements"])
         stranger = auth_headers(client, "stranger@example.com", records["password"])
-        assert client.post(
-            f"/api/v1/portal/collection-requests/{records['request']}/classify",
-            headers=stranger,
-            json=payload,
-        ).status_code == 404
+        assert client.get(path, headers=stranger).status_code == 404
+        assert client.post(path + "/confirm", headers=stranger, json=choice).status_code == 404
+        # A failed provider can use the same safely scanned files without re-uploading.
+        assert client.post(path + "/manual", headers=headers).json()["status"] == "FAILED"
+        for _ in range(2):
+            confirmed = client.post(path + "/confirm", headers=headers, json=choice)
+            assert confirmed.status_code == 200, confirmed.text
+            assert confirmed.json()["confirmed_at"]
+        files = [file for req in client.get(base, headers=headers).json()["requirements"] for file in req["documents"]]
+        assert len(files) == 1
+        assert client.post(path + "/cancel", headers=headers).status_code == 409
+        choice["items"][0]["category"], choice["items"][0]["requirement_id"] = "OTHER", None
+        assert client.post(path + "/confirm", headers=headers, json=choice).status_code == 409
+        second = client.post(base + "/classification-runs", headers=headers).json()
+        second_path = base + "/classification-runs/" + second["id"]
+        assert client.post(base + "/documents", headers=headers, data={"classification_run_id": second["id"]}, files={"file": ("extra.pdf", b"%PDF-1.7\nextra", "application/pdf")}).status_code == 202
+        assert client.post(second_path + "/cancel", headers=headers).json()["status"] == "CANCELLED"
+        assert client.post(second_path + "/start", headers=headers).status_code == 409
+        assert client.post(second_path + "/confirm", headers=headers, json=choice).status_code == 409
+        assert len([file for req in client.get(base, headers=headers).json()["requirements"] for file in req["documents"]]) == 1
+
+
+@pytest.mark.parametrize("result_kind", ["valid", "wrong_id", "finding", "cancel", "unavailable"])
+def test_classification_worker_validates_and_discards_late_results(records, monkeypatch, result_kind):
+    import io
+    import json
+    from urllib.error import URLError
+    from uuid import UUID, uuid4
+    from app import classification_worker
+    from app.models import AIRun
+
+    monkeypatch.setattr(settings, "agent_classification_provider", "REMOTE")
+    base = f"/api/v1/portal/collection-requests/{records['request']}"
+    with TestClient(app) as client:
+        headers = auth_headers(client, "client@example.com", records["password"])
+        run = client.post(base + "/classification-runs", headers=headers).json()
+        path = base + "/classification-runs/" + run["id"]
+        doc = client.post(base + "/documents", headers=headers, data={"classification_run_id": run["id"]}, files={"file": ("bank.pdf", b"%PDF-1.7\nbank statement", "application/pdf")}).json()["document_id"]
+        assert process_next_document()
+        assert client.post(path + "/start", headers=headers).status_code == 200
+
+        def respond(request, **kwargs):
+            body = json.loads(request.data)
+            assert body["purpose"] == "CLASSIFY" and body["run_id"] == run["id"]
+            assert set(body["documents"][0]) == {"document_id", "storage_key", "content_type", "sha256", "original_name"}
+            if result_kind == "unavailable": raise URLError("secret error")
+            if result_kind == "cancel": assert client.post(path + "/cancel", headers=headers).status_code == 200
+            result = {"schema_version": "1", "run_id": str(uuid4()) if result_kind == "wrong_id" else run["id"], "model_version": "test-v1", "classifications": [{"document_id": doc, "category": "REQUIREMENT", "requirement_id": str(records["required"]), "document_type": "BANK_STATEMENT", "confidence": 0.99}]}
+            if result_kind == "finding": result["classifications"][0]["finding"] = "APPROVE"
+            return io.BytesIO(json.dumps(result).encode())
+
+        monkeypatch.setattr(classification_worker, "urlopen", respond)
+        assert classification_worker.process_classification()
+        if result_kind == "unavailable":
+            for _ in range(2):
+                with SessionLocal.begin() as db: db.get(AIRun, UUID(run["id"])).next_attempt_at = None
+                assert classification_worker.process_classification()
+        result = client.get(path, headers=headers).json()
+        assert result["status"] == ("SUCCEEDED" if result_kind == "valid" else "CANCELLED" if result_kind == "cancel" else "FAILED")
+        assert "secret" not in str(result)
+        assert client.get(base, headers=headers).json()["submission"] is None
+        assert not classification_worker.process_classification()
+        if result_kind == "valid":
+            with SessionLocal.begin() as db:
+                db.get(CollectionRequest, records["request"]).status = "CHANGES_REQUESTED"
+                db.get(Requirement, records["required"]).status = "SATISFIED"
+            choice = {"items": [{"document_id": doc, "category": "REQUIREMENT", "requirement_id": str(records["required"])}]}
+            assert client.post(path + "/confirm", headers=headers, json=choice).status_code == 409
 
 
 def test_production_never_releases_a_file_without_clamav(tmp_path, monkeypatch):
@@ -321,16 +430,6 @@ def test_review_changes_resubmit_approve_reopen_and_close(records):
         requirement = next(value for value in review["requirements"] if value["required"])
         optional = next(value for value in review["requirements"] if not value["required"])
         submission_id = review["submissions"][-1]["id"]
-        accepted_review = client.post(
-            f"/api/v1/requirements/{records['optional']}/review",
-            headers=admin,
-            json={
-                "version": optional["version"],
-                "submission_id": submission_id,
-                "decision": "SATISFY",
-            },
-        )
-        assert accepted_review.status_code == 200, accepted_review.text
         invalid = client.post(
             f"/api/v1/requirements/{records['required']}/review",
             headers=admin,
@@ -355,10 +454,27 @@ def test_review_changes_resubmit_approve_reopen_and_close(records):
         )
         assert reviewed.status_code == 200, reviewed.text
         assert reviewed.json()["requirements"][0]["status"] == "NEEDS_ACTION"
+        incomplete_return = client.post(
+            f"/api/v1/collection-requests/{records['request']}/request-changes",
+            headers={**admin, "Idempotency-Key": "request-changes-incomplete"},
+            json={"version": reviewed.json()["version"], "reason": "Wrong period"},
+        )
+        assert incomplete_return.status_code == 422
+        assert incomplete_return.json()["code"] == "REVIEW_INCOMPLETE"
+        accepted_review = client.post(
+            f"/api/v1/requirements/{records['optional']}/review",
+            headers=admin,
+            json={
+                "version": optional["version"],
+                "submission_id": submission_id,
+                "decision": "SATISFY",
+            },
+        )
+        assert accepted_review.status_code == 200, accepted_review.text
         returned = client.post(
             f"/api/v1/collection-requests/{records['request']}/request-changes",
             headers={**admin, "Idempotency-Key": "request-changes-1"},
-            json={"version": reviewed.json()["version"], "reason": "Wrong period"},
+            json={"version": accepted_review.json()["version"], "reason": "Wrong period"},
         )
         assert returned.status_code == 200, returned.text
         assert returned.json()["status"] == "CHANGES_REQUESTED"

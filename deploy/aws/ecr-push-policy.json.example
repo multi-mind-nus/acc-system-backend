@@ -20,7 +20,8 @@
       "Resource": [
         "arn:aws:ecr:ap-southeast-1:<AWS_ACCOUNT_ID>:repository/acc-system-backend",
         "arn:aws:ecr:ap-southeast-1:<AWS_ACCOUNT_ID>:repository/acc-system-frontend",
-        "arn:aws:ecr:ap-southeast-1:<AWS_ACCOUNT_ID>:repository/acc-system-nginx"
+        "arn:aws:ecr:ap-southeast-1:<AWS_ACCOUNT_ID>:repository/acc-system-nginx",
+        "arn:aws:ecr:ap-southeast-1:<AWS_ACCOUNT_ID>:repository/acc-system-agent"
       ]
     }
   ]
