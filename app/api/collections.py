@@ -15,6 +15,7 @@ from app.collection_schemas import (
     CollectionCreate,
     CollectionDashboardOut,
     CollectionDetailOut,
+    CollectionFilterStatus,
     CollectionListOut,
     CollectionStatus,
     CollectionSummaryOut,
@@ -38,6 +39,7 @@ from app.models import (
     User,
     WorkflowEvent,
 )
+from app.review_analysis import collection_review_status
 
 router = APIRouter(prefix="/api/v1/collection-requests")
 requirements_router = APIRouter(prefix="/api/v1/requirements")
@@ -94,8 +96,8 @@ def _events(db, request_id: UUID) -> list[WorkflowEventOut]:
 
 
 def _summary(
-    item: CollectionRequest, client_name: str, assignee_name: str,
-    requirement_count: int,
+    db, item: CollectionRequest, client_name: str, assignee_name: str,
+    requirement_count: int, requirements=None,
 ) -> CollectionSummaryOut:
     return CollectionSummaryOut(
         id=item.id,
@@ -110,6 +112,7 @@ def _summary(
         assignee_name=assignee_name,
         requirement_count=requirement_count,
         updated_at=item.updated_at,
+        review_status=collection_review_status(db, item, requirements),
     )
 
 
@@ -122,7 +125,7 @@ def _detail(db, item: CollectionRequest) -> CollectionDetailOut:
         ai_satisfy_threshold=item.ai_satisfy_threshold,
         ai_request_action_threshold=item.ai_request_action_threshold,
         **_summary(
-            item, client.legal_name, assignee.name, len(requirements)
+            db, item, client.legal_name, assignee.name, len(requirements), requirements
         ).model_dump(),
         requirements=[RequirementOut.model_validate({
             "id": requirement.id,
@@ -265,7 +268,7 @@ def dashboard(db: DbSession, principal: Staff):
         )))
         .order_by(CollectionRequest.due_at)
     ).all()
-    items = [_summary(*row) for row in rows]
+    items = [_summary(db, *row) for row in rows]
     now = datetime.now(UTC)
     due_limit = now + timedelta(days=7)
     awaiting = [item for item in items if item.status == "IN_REVIEW" and item.assignee_id == principal.user.id]
@@ -294,7 +297,7 @@ def list_collections(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     client_id: UUID | None = None,
     period: date | None = None,
-    status: CollectionStatus | None = None,
+    status: CollectionFilterStatus | None = None,
     assignee_id: UUID | None = None,
     due_from: datetime | None = None,
     due_to: datetime | None = None,
@@ -307,21 +310,30 @@ def list_collections(
     if period:
         statement = statement.where(CollectionRequest.period == period)
     if status:
-        statement = statement.where(CollectionRequest.status == status)
+        statement = statement.where(CollectionRequest.status == ("IN_REVIEW" if status == "AI_PASSED" else status))
     if assignee_id:
         statement = statement.where(CollectionRequest.assignee_id == assignee_id)
     if due_from:
         statement = statement.where(CollectionRequest.due_at >= due_from)
     if due_to:
         statement = statement.where(CollectionRequest.due_at <= due_to)
-    total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     sort_column = getattr(CollectionRequest, sort)
     statement = statement.order_by(
         sort_column.desc() if order == "desc" else sort_column.asc(),
         CollectionRequest.id,
-    ).offset((page - 1) * page_size).limit(page_size)
+    )
+    if status == "AI_PASSED":
+        items = [_summary(db, *row) for row in db.execute(statement).all()]
+        items = [item for item in items if item.review_status == "AI_PASSED"]
+        total = len(items)
+        items = items[(page - 1) * page_size:page * page_size]
+    else:
+        total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+        items = [_summary(db, *row) for row in db.execute(
+            statement.offset((page - 1) * page_size).limit(page_size)
+        ).all()]
     return CollectionListOut(
-        items=[_summary(*row) for row in db.execute(statement).all()],
+        items=items,
         total=total,
         page=page,
         page_size=page_size,

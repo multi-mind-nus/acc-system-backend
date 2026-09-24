@@ -52,13 +52,13 @@ class PortalCollectionSummaryOut(BaseModel):
     required_count: int
     ready_count: int
     updated_at: datetime
+    review_status: Literal["PROCESSING", "AI_PASSED", "AWAITING_ACCOUNTANT"] | None = None
 
 
 class PortalCollectionDetailOut(PortalCollectionSummaryOut):
     scope_note: str | None
     requirements: list[PortalRequirementOut]
     submission: PortalSubmissionOut | None
-    review_status: Literal["PROCESSING", "AWAITING_ACCOUNTANT"] | None = None
 
 
 class PortalCollectionListOut(BaseModel):

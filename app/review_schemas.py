@@ -27,9 +27,12 @@ class RequirementReviewInput(BaseModel):
     issue_code: IssueCode | None = None
     client_message: str | None = Field(default=None, max_length=2000)
     internal_note: str | None = Field(default=None, max_length=4000)
+    evidence: list[EvidenceInput] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def validate_reason(self):
+        if len({item.document_id for item in self.evidence}) != len(self.evidence):
+            raise ValueError("Duplicate evidence")
         if self.decision == "REQUEST_ACTION" and not (
             self.issue_code and self.client_message
         ):

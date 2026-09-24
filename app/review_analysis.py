@@ -10,11 +10,37 @@ from sqlalchemy import or_, select
 from app.analysis_schemas import ReviewRequest, validate_review
 from app.config import settings
 from app.db import SessionLocal
-from app.models import AIRun, Client, CollectionRequest, Document, Requirement, RequirementDocument, Submission
+from app.models import (
+    AIRun, Client, ClientMember, CollectionRequest, Document, NotificationOutbox,
+    Requirement, RequirementDocument, ReviewDecision, ReviewDecisionDocument,
+    Submission, User, WorkflowEvent,
+)
 
 
 def file_reference(doc, requirement_ids=(), scope="CURRENT"):
     return {"document_id": str(doc.id), "storage_key": doc.storage_key, "content_type": doc.content_type, "sha256": doc.sha256, "original_name": doc.original_name, "requirement_ids": [str(id) for id in requirement_ids], "scope": scope}
+
+
+def collection_review_status(db, item, requirements=None, submission=None):
+    if item.status != "IN_REVIEW":
+        return None
+    requirements = requirements if requirements is not None else list(db.scalars(select(Requirement).where(Requirement.request_id == item.id)))
+    submission = submission or db.scalar(select(Submission).where(
+        Submission.request_id == item.id, Submission.status == "SUBMITTED",
+    ).order_by(Submission.round_no.desc()).limit(1))
+    run = db.scalar(select(AIRun).where(
+        AIRun.request_id == item.id,
+        AIRun.submission_id == submission.id,
+        AIRun.purpose == "REVIEW",
+    ).order_by(AIRun.created_at.desc()).limit(1)) if submission else None
+    if run and run.status in ("QUEUED", "PROCESSING"):
+        return "PROCESSING"
+    findings = (run.output or {}).get("findings", []) if run else []
+    if run and run.status == "SUCCEEDED" and findings \
+            and all(value.get("suggested_decision") == "SATISFY" and not value.get("manual_reasons") for value in findings) \
+            and all(requirement.status == "SATISFIED" for requirement in requirements):
+        return "AI_PASSED"
+    return "AWAITING_ACCOUNTANT"
 
 
 def enqueue_review(db, item, submission, user_id):
@@ -165,6 +191,10 @@ def process_review():
             run.next_attempt_at = datetime.now(UTC) + timedelta(seconds=2 ** snapshot["turn_attempts"])
         else:
             output = result.model_dump(mode="json")
+            requirements = {value.id: value for value in db.scalars(select(Requirement).where(
+                Requirement.request_id == item.id,
+            ).with_for_update())}
+            auto_returned = []
             for finding, row in zip(result.findings, output["findings"], strict=True):
                 threshold = item.ai_satisfy_threshold if finding.suggested_decision == "SATISFY" else item.ai_request_action_threshold
                 row["manual_reasons"] = []
@@ -175,8 +205,70 @@ def process_review():
                 row["amounts_valid"] = all(amount_valid(relation) for relation in finding.amounts)
                 if not row["amounts_valid"]:
                     row["manual_reasons"].append("AMOUNT_MISMATCH")
-                # B6.3 records suggestions only. B6.4 adds guarded automatic decisions.
-                row["manual_reasons"].append("MANUAL_REVIEW_REQUIRED")
+                requirement = requirements[finding.requirement_id]
+                can_apply = (
+                    item.ai_mode == "AUTO_REVIEW"
+                    and finding.suggested_decision in ("SATISFY", "REQUEST_ACTION")
+                    and not row["manual_reasons"]
+                    and requirement.status in ("PENDING", "RECEIVED")
+                )
+                row["auto_applied"] = can_apply
+                if not can_apply:
+                    if requirement.status not in ("SATISFIED", "WAIVED"):
+                        row["manual_reasons"].append("MANUAL_REVIEW_REQUIRED")
+                    continue
+                now = datetime.now(UTC)
+                requirement.status = "SATISFIED" if finding.suggested_decision == "SATISFY" else "NEEDS_ACTION"
+                requirement.issue_code = finding.issue_code if finding.suggested_decision == "REQUEST_ACTION" else None
+                requirement.client_message = finding.client_message
+                requirement.internal_note = None
+                requirement.reviewed_by = None
+                requirement.reviewed_at = now
+                decision = ReviewDecision(
+                    firm_id=item.firm_id, requirement_id=requirement.id,
+                    submission_id=run.submission_id, decision=finding.suggested_decision,
+                    issue_code=finding.issue_code, client_message=finding.client_message,
+                    internal_note=None, created_by=None, source="AI", ai_run_id=run.id,
+                )
+                db.add(decision)
+                db.flush()
+                db.add_all(ReviewDecisionDocument(
+                    decision_id=decision.id, document_id=value.document_id, relation=value.relation,
+                ) for value in finding.evidence)
+                db.add(WorkflowEvent(
+                    firm_id=item.firm_id, request_id=item.id, actor_id=None,
+                    actor_type="SYSTEM", event_type="AI_REQUIREMENT_REVIEWED",
+                    payload={"requirement_id": str(requirement.id), "decision": finding.suggested_decision, "ai_run_id": str(run.id)},
+                    created_at=now,
+                ))
+                item.updated_at = now
+                if finding.suggested_decision != "REQUEST_ACTION":
+                    continue
+                auto_returned.append(finding)
+                recipients = db.execute(select(User.id, User.email).join(
+                    ClientMember,
+                    (ClientMember.user_id == User.id) & (ClientMember.firm_id == User.firm_id),
+                ).where(
+                    ClientMember.firm_id == item.firm_id,
+                    ClientMember.client_id == item.client_id,
+                    ClientMember.role.in_(("CLIENT_ADMIN", "CLIENT_SUBMITTER")),
+                    User.status == "ACTIVE",
+                )).all()
+                for user_id, email in {email.lower(): (user_id, email) for user_id, email in recipients}.values():
+                    db.add(NotificationOutbox(
+                        firm_id=item.firm_id, request_id=item.id, recipient=email,
+                        template="AI_REQUIREMENT_ACTION",
+                        payload={"requirement_id": str(requirement.id), "client_message": finding.client_message},
+                        dedupe_key=f"ai-review:{run.id}:{requirement.id}:{user_id}",
+                    ))
+            if auto_returned:
+                item.status = "CHANGES_REQUESTED"
+                db.add(WorkflowEvent(
+                    firm_id=item.firm_id, request_id=item.id, actor_id=None,
+                    actor_type="SYSTEM", event_type="CHANGES_REQUESTED",
+                    payload={"reason": "\n".join(value.client_message for value in auto_returned)},
+                    created_at=datetime.now(UTC),
+                ))
             run.output, run.model_version, run.status, run.error = output, result.model_version, "SUCCEEDED", None
             for extraction in result.extractions:
                 doc = docs[extraction.document_id]

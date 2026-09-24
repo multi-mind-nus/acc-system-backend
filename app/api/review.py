@@ -263,18 +263,10 @@ def review_requirement(
     if submission is None:
         raise APIError(422, "INVALID_SUBMISSION", "Submission does not belong to this request")
 
-    current_documents = list(db.scalars(
-        select(Document)
-        .join(RequirementDocument, RequirementDocument.document_id == Document.id)
-        .where(
-            RequirementDocument.request_id == item.id,
-            RequirementDocument.submission_id == submission.id,
-            RequirementDocument.requirement_id == requirement.id,
-            RequirementDocument.excluded_at.is_(None),
-            RequirementDocument.relation != "REFERENCE",
-            Document.status == "AVAILABLE",
-        )
-    ))
+    from app.review_analysis import authorized_documents
+    evidence = authorized_documents(db, item, [value.document_id for value in body.evidence])
+    if len(evidence) != len(body.evidence):
+        raise APIError(422, "INVALID_EVIDENCE", "Evidence does not belong to this client")
     now = datetime.now(UTC)
     requirement.status = {
         "SATISFY": "SATISFIED",
@@ -298,17 +290,11 @@ def review_requirement(
     )
     db.add(decision)
     db.flush()
-    automatic_relation = {
-        "SATISFY": "SUPPORTS",
-        "REQUEST_ACTION": "CONTRADICTS",
-        "WAIVE": "REFERENCE",
-    }[body.decision]
-    relations = {document.id: automatic_relation for document in current_documents}
-    for document_id, relation in relations.items():
+    for value in body.evidence:
         db.add(ReviewDecisionDocument(
             decision_id=decision.id,
-            document_id=document_id,
-            relation=relation,
+            document_id=value.document_id,
+            relation=value.relation,
         ))
     _event(db, principal, item, "REQUIREMENT_REVIEWED", {
         "requirement_id": str(requirement.id),

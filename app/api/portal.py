@@ -11,7 +11,7 @@ from fastapi.responses import Response
 from sqlalchemy import func, select
 
 from app.auth import Principal, current_principal, ensure_client_access
-from app.collection_schemas import CollectionStatus
+from app.collection_schemas import CollectionFilterStatus
 from app.classification_schemas import StagedUploadOut
 from app.config import settings
 from app.db import DbSession
@@ -37,6 +37,7 @@ from app.portal_schemas import (
     PortalSubmitInput,
     PortalUploadOut,
 )
+from app.review_analysis import collection_review_status
 
 router = APIRouter(prefix="/api/v1/portal")
 PortalUser = Annotated[Principal, Depends(current_principal)]
@@ -201,6 +202,7 @@ def _summary(db, item: CollectionRequest) -> PortalCollectionSummaryOut:
             for requirement in requirements
         ),
         updated_at=item.updated_at,
+        review_status=collection_review_status(db, item, requirements, latest),
     )
 
 
@@ -225,11 +227,9 @@ def _detail(db, item: CollectionRequest) -> PortalCollectionDetailOut:
             counts_for_submission=link.submission_id == current_draft_id,
         ))
     summary = _summary(db, item)
-    review_run = db.scalar(select(AIRun).where(AIRun.request_id == item.id, AIRun.submission_id == latest.id, AIRun.purpose == "REVIEW").order_by(AIRun.created_at.desc()).limit(1)) if latest and latest.status == "SUBMITTED" else None
     return PortalCollectionDetailOut(
         **summary.model_dump(),
         scope_note=item.scope_note,
-        review_status=("PROCESSING" if review_run and review_run.status in ("QUEUED", "PROCESSING") else "AWAITING_ACCOUNTANT") if item.status == "IN_REVIEW" else None,
         requirements=[PortalRequirementOut(
             id=requirement.id,
             type=requirement.type,
@@ -259,7 +259,7 @@ def list_collections(
     principal: PortalUser,
     client_id: UUID | None = None,
     period: date | None = None,
-    status: CollectionStatus | None = None,
+    status: CollectionFilterStatus | None = None,
     sort: Literal["due_at", "period", "updated_at"] = "updated_at",
     order: Literal["asc", "desc"] = "desc",
 ):
@@ -274,14 +274,16 @@ def list_collections(
     if period:
         statement = statement.where(CollectionRequest.period == period)
     if status:
-        statement = statement.where(CollectionRequest.status == status)
+        statement = statement.where(CollectionRequest.status == ("IN_REVIEW" if status == "AI_PASSED" else status))
     sort_column = getattr(CollectionRequest, sort)
     statement = statement.order_by(
         sort_column.desc() if order == "desc" else sort_column.asc(),
         CollectionRequest.id,
     )
-    items = list(db.scalars(statement)) if client_ids else []
-    return PortalCollectionListOut(items=[_summary(db, item) for item in items], total=len(items))
+    summaries = [_summary(db, item) for item in db.scalars(statement)] if client_ids else []
+    if status == "AI_PASSED":
+        summaries = [item for item in summaries if item.review_status == "AI_PASSED"]
+    return PortalCollectionListOut(items=summaries, total=len(summaries))
 
 
 @router.get("/collection-requests/{request_id}", response_model=PortalCollectionDetailOut)

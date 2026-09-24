@@ -552,6 +552,7 @@ def test_review_changes_resubmit_approve_reopen_and_close(records):
                 "submission_id": review["submissions"][-1]["id"],
                 "decision": "SATISFY",
                 "client_message": "September statement received.",
+                "evidence": [{"document_id": str(replacement_document), "relation": "SUPPORTS"}],
             },
         )
         assert satisfied.status_code == 200, satisfied.text

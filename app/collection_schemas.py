@@ -9,6 +9,7 @@ CollectionStatus = Literal[
     "DRAFT", "OPEN", "IN_REVIEW", "CHANGES_REQUESTED",
     "READY_FOR_BOOKKEEPING", "CLOSED", "CANCELLED",
 ]
+CollectionFilterStatus = CollectionStatus | Literal["AI_PASSED"]
 RequirementStatus = Literal[
     "PENDING", "RECEIVED", "NEEDS_ACTION", "SATISFIED", "WAIVED",
 ]
@@ -113,6 +114,7 @@ class CollectionSummaryOut(BaseModel):
     assignee_name: str
     requirement_count: int
     updated_at: datetime
+    review_status: Literal["PROCESSING", "AI_PASSED", "AWAITING_ACCOUNTANT"] | None = None
 
 
 class WorkflowEventOut(BaseModel):

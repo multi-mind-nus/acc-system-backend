@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.analysis_schemas import AmountRelation
 from app.db import SessionLocal
 from app.main import app
-from app.models import AIRun, Client, CollectionRequest, Document, Firm, FirmMember, Requirement, RequirementDocument, ReviewDecision, Submission, User
+from app.models import AIRun, Client, CollectionRequest, Document, Firm, FirmMember, NotificationOutbox, Requirement, RequirementDocument, ReviewDecision, Submission, User, WorkflowEvent
 from app.review_analysis import amount_valid, authorized_documents, process_review
 from app.worker import process_next_document
 from test_portal import clean_state, records, auth_headers, upload  # noqa: F401
@@ -18,6 +18,26 @@ from test_portal import clean_state, records, auth_headers, upload  # noqa: F401
 def response(body):
     return {"schema_version": "1", "run_id": str(body.run_id), "model_version": "test-review-v1", "extractions": [{"document_id": str(d.document_id), "entity_name": "First Client", "period": "2026-09-01", "amount": "10.00", "currency": "SGD"} for d in body.documents],
         "findings": [{"requirement_id": str(r.id), "action": "ESCALATE", "suggested_decision": None, "issue_code": None, "confidence": 0.5, "entity_check": "UNKNOWN", "period_check": "UNKNOWN", "explanation": "Manual verification required", "client_message": None, "evidence": [{"document_id": str(d.document_id), "relation": "REFERENCE", "reason": "Check source"} for d in body.documents], "amounts": []} for r in body.requirements]}
+
+
+def automatic_response(body, requirement_id, decision):
+    result = response(body)
+    document = next(value for value in body.documents if requirement_id in value.requirement_ids)
+    for finding in result["findings"]:
+        if finding["requirement_id"] != str(requirement_id):
+            continue
+        finding.update(
+            action="RESOLVE" if decision == "SATISFY" else "ASK_CLIENT",
+            suggested_decision=decision,
+            issue_code=None if decision == "SATISFY" else "WRONG_PERIOD",
+            confidence=0.99,
+            entity_check="MATCH",
+            period_check="MATCH" if decision == "SATISFY" else "MISMATCH",
+            explanation="Validated automatically",
+            client_message=None if decision == "SATISFY" else "Please upload the correct period.",
+            evidence=[] if decision == "REQUEST_ACTION" else [{"document_id": str(document.document_id), "relation": "SUPPORTS", "reason": "Matches the request"}],
+        )
+    return result
 
 
 def submitted(client, records):
@@ -54,6 +74,76 @@ def test_submit_analysis_is_advisory_private_and_idempotent(records, monkeypatch
             assert db.get(Requirement, records["required"]).status == "RECEIVED"
             assert not db.scalar(select(ReviewDecision))
             assert db.scalar(select(Document)).extracted_data["amount"] == "10.00"
+
+
+def test_auto_review_returns_failed_item_to_client(records, monkeypatch):
+    monkeypatch.setattr("app.review_analysis.call_agent", lambda body: automatic_response(body, records["required"], "REQUEST_ACTION"))
+    with TestClient(app) as client:
+        portal, staff = submitted(client, records)
+        assert process_review() and not process_review()
+        result = client.get(f"/api/v1/collection-requests/{records['request']}/review-runs", headers=staff).json()[0]
+        finding = next(value for value in result["output"]["findings"] if value["requirement_id"] == str(records["required"]))
+        assert finding["auto_applied"] is True and finding["manual_reasons"] == []
+        review = client.get(f"/api/v1/collection-requests/{records['request']}/review", headers=staff).json()
+        requirement = next(value for value in review["requirements"] if value["id"] == str(records["required"]))
+        assert review["status"] == "CHANGES_REQUESTED" and requirement["status"] == "NEEDS_ACTION"
+        assert requirement["decisions"][0]["source"] == "AI"
+        assert client.get(f"/api/v1/portal/collection-requests/{records['request']}", headers=portal).json()["status"] == "CHANGES_REQUESTED"
+        with SessionLocal() as db:
+            assert len(list(db.scalars(select(ReviewDecision)))) == 1
+            assert len(list(db.scalars(select(WorkflowEvent).where(WorkflowEvent.event_type == "AI_REQUIREMENT_REVIEWED")))) == 1
+            notice = db.scalar(select(NotificationOutbox))
+            assert notice.status == "SUPPRESSED" and notice.last_error == "PROVIDER_DISABLED"
+        assert upload(client, portal, records["request"], records["required"], b"%PDF-1.7\ncorrected").status_code == 202
+        assert process_next_document()
+        resubmitted = client.post(f"/api/v1/portal/collection-requests/{records['request']}/submit", headers=portal)
+        assert resubmitted.status_code == 200 and resubmitted.json()["status"] == "IN_REVIEW"
+
+
+def test_auto_review_passes_items_but_waits_for_whole_request_confirmation(records, monkeypatch):
+    with SessionLocal.begin() as db:
+        db.delete(db.get(Requirement, records["optional"]))
+    monkeypatch.setattr("app.review_analysis.call_agent", lambda body: automatic_response(body, records["required"], "SATISFY"))
+    with TestClient(app) as client:
+        portal, staff = submitted(client, records)
+        assert process_review()
+        result = client.get(f"/api/v1/collection-requests/{records['request']}/review-runs", headers=staff).json()[0]
+        finding = next(value for value in result["output"]["findings"] if value["requirement_id"] == str(records["required"]))
+        assert finding["auto_applied"] is True and finding["manual_reasons"] == []
+        with SessionLocal() as db:
+            assert db.get(CollectionRequest, records["request"]).status == "IN_REVIEW"
+            assert db.get(Requirement, records["required"]).status == "SATISFIED"
+            assert db.scalar(select(ReviewDecision)).source == "AI"
+        public = client.get(f"/api/v1/portal/collection-requests/{records['request']}", headers=portal).json()
+        assert public["status"] == "IN_REVIEW" and public["review_status"] == "AI_PASSED"
+        summary = next(value for value in client.get("/api/v1/collection-requests", headers=staff).json()["items"] if value["id"] == str(records["request"]))
+        assert summary["status"] == "IN_REVIEW" and summary["review_status"] == "AI_PASSED"
+        staff_filtered = client.get("/api/v1/collection-requests?status=AI_PASSED", headers=staff).json()
+        portal_filtered = client.get("/api/v1/portal/collection-requests?status=AI_PASSED", headers=portal).json()
+        assert [item["id"] for item in staff_filtered["items"]] == [str(records["request"])]
+        assert [item["id"] for item in portal_filtered["items"]] == [str(records["request"])]
+        review = client.get(f"/api/v1/collection-requests/{records['request']}/review", headers=staff).json()
+        approved = client.post(
+            f"/api/v1/collection-requests/{records['request']}/approve",
+            headers={**staff, "Idempotency-Key": "confirm-complete-ai-round"},
+            json={"version": review["version"]},
+        )
+        assert approved.status_code == 200 and approved.json()["status"] == "READY_FOR_BOOKKEEPING"
+
+
+@pytest.mark.parametrize("mode,threshold", [("SUGGEST", "0.980"), ("AUTO_REVIEW", "1.000")])
+def test_auto_review_respects_mode_and_threshold(records, monkeypatch, mode, threshold):
+    with SessionLocal.begin() as db:
+        item = db.get(CollectionRequest, records["request"])
+        item.ai_mode = mode
+        item.ai_request_action_threshold = threshold
+    monkeypatch.setattr("app.review_analysis.call_agent", lambda body: automatic_response(body, records["required"], "REQUEST_ACTION"))
+    with TestClient(app) as client:
+        submitted(client, records)
+        assert process_review()
+        with SessionLocal() as db:
+            assert not db.scalar(select(ReviewDecision))
+            assert db.get(Requirement, records["required"]).status == "RECEIVED"
 
 
 @pytest.mark.parametrize("failure", ["timeout", "evidence", "run_id", "schema", "search_limit", "stale"])
