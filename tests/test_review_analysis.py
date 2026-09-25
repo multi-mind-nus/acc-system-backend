@@ -185,6 +185,115 @@ def test_auto_review_passes_items_but_waits_for_whole_request_confirmation(recor
         assert approved.status_code == 200 and approved.json()["status"] == "READY_FOR_BOOKKEEPING"
 
 
+def test_expense_claim_cannot_auto_pass_with_a_missing_original_receipt(records, monkeypatch):
+    with SessionLocal.begin() as db:
+        receipt = db.get(Requirement, records["optional"])
+        receipt.required = True
+        claim = Requirement(firm_id=receipt.firm_id, request_id=receipt.request_id,
+                            position=2, type="EXPENSE_CLAIM", title="Expense claim", required=True)
+        db.add(claim)
+        db.flush()
+        claim_id = claim.id
+
+    def agent(body):
+        result = response(body)
+        documents = {kind: next(doc for doc in body.documents if doc.document_type == kind)
+                     for kind in ("BANK_STATEMENT", "EXPENSE_CLAIM", "RECEIPT")}
+        for extraction in result["extractions"]:
+            kind = next(doc.document_type for doc in body.documents
+                        if str(doc.document_id) == extraction["document_id"])
+            extraction.update(document_type=kind, currency="SGD",
+                              amount="305.92" if kind == "EXPENSE_CLAIM" else "39.52")
+            if kind == "EXPENSE_CLAIM":
+                extraction["transactions"] = [
+                    {"date": "2026-09-01", "description": "First expense", "amount": "39.52", "currency": "SGD"},
+                    {"date": "2026-09-02", "description": "Second expense", "amount": "266.40", "currency": "SGD"},
+                ]
+        for finding in result["findings"]:
+            finding.update(action="RESOLVE", suggested_decision="SATISFY",
+                           entity_check="MATCH", period_check="MATCH",
+                           explanation="Claim total matches bank debit", evidence=[
+                               {"document_id": str(doc.document_id), "relation": "SUPPORTS", "reason": "Source"}
+                               for doc in documents.values()])
+        return result
+
+    monkeypatch.setattr("app.review_analysis.call_agent", agent)
+    with TestClient(app) as client:
+        portal = auth_headers(client, "client@example.com", records["password"])
+        for kind, requirement_id in (("BANK_STATEMENT", records["required"]),
+                                     ("RECEIPT", records["optional"]),
+                                     ("EXPENSE_CLAIM", claim_id)):
+            uploaded = upload(client, portal, records["request"], requirement_id,
+                              f"%PDF-1.7\n{kind}".encode())
+            assert uploaded.status_code == 202
+            assert process_next_document()
+            with SessionLocal.begin() as db:
+                db.get(Document, UUID(uploaded.json()["document"]["id"])).document_type = kind
+        submitted = client.post(f"/api/v1/portal/collection-requests/{records['request']}/submit", headers=portal)
+        assert submitted.status_code == 200
+        assert process_review()
+    with SessionLocal() as db:
+        run = db.scalar(select(AIRun).where(AIRun.purpose == "REVIEW"))
+        assert run.status == "FAILED" and run.error == "AGENT_INVALID_RESPONSE"
+        assert not db.scalar(select(ReviewDecision))
+        assert all(row.status != "SATISFIED" for row in db.scalars(select(Requirement)))
+
+
+def test_missing_support_is_returned_on_the_document_requirement(records, monkeypatch):
+    with SessionLocal.begin() as db:
+        invoice = db.get(Requirement, records["optional"])
+        invoice.required = True
+        invoice.type = "SUPPLIER_INVOICE"
+        invoice.title = "Supplier invoices"
+
+    def agent(body):
+        if not body.turn:
+            return {"schema_version": "1", "run_id": str(body.run_id), "model_version": "test",
+                    "extractions": [], "findings": [], "search": {
+                        "action": "SEARCH_CURRENT", "requirement_id": str(records["required"]),
+                        "document_type": "SUPPLIER_INVOICE"}}
+        evidence = [{"document_id": str(doc.document_id), "relation": "REFERENCE", "reason": "Current evidence"}
+                    for doc in body.documents]
+        return {"schema_version": "1", "run_id": str(body.run_id), "model_version": "test",
+                "extractions": [{"document_id": str(doc.document_id), "document_type": doc.document_type}
+                                for doc in body.documents], "findings": [
+                    {"requirement_id": str(records["required"]), "action": "ESCALATE",
+                     "suggested_decision": None, "issue_code": "INCOMPLETE",
+                     "entity_check": "MATCH", "period_check": "MATCH",
+                     "explanation": "Bank payment awaits supporting invoices", "evidence": evidence},
+                    {"requirement_id": str(records["optional"]), "action": "ASK_CLIENT",
+                     "suggested_decision": "REQUEST_ACTION", "issue_code": "INCOMPLETE",
+                     "requested_document_type": "SUPPLIER_INVOICE",
+                     "entity_check": "MATCH", "period_check": "MATCH",
+                     "explanation": "Supplier invoices do not cover the payment",
+                     "client_message": "Please upload the remaining supplier invoices.", "evidence": evidence},
+                ]}
+
+    monkeypatch.setattr("app.review_analysis.call_agent", agent)
+    with TestClient(app) as client:
+        portal = auth_headers(client, "client@example.com", records["password"])
+        for kind, requirement_id in (("BANK_STATEMENT", records["required"]),
+                                     ("SUPPLIER_INVOICE", records["optional"])):
+            uploaded = upload(client, portal, records["request"], requirement_id,
+                              f"%PDF-1.7\n{kind}".encode())
+            assert uploaded.status_code == 202
+            assert process_next_document()
+            with SessionLocal.begin() as db:
+                db.get(Document, UUID(uploaded.json()["document"]["id"])).document_type = kind
+        assert client.post(f"/api/v1/portal/collection-requests/{records['request']}/submit",
+                           headers=portal).status_code == 200
+        assert process_review() and process_review()
+    with SessionLocal() as db:
+        request = db.get(CollectionRequest, records["request"])
+        bank = db.get(Requirement, records["required"])
+        invoice = db.get(Requirement, records["optional"])
+        decisions = list(db.scalars(select(ReviewDecision)))
+        assert request.status == "CHANGES_REQUESTED"
+        assert bank.status == "RECEIVED"
+        assert invoice.status == "NEEDS_ACTION"
+        assert [decision.requirement_id for decision in decisions] == [invoice.id]
+
+
 def test_suggest_mode_never_applies_agent_decision(records, monkeypatch):
     with SessionLocal.begin() as db:
         item = db.get(CollectionRequest, records["request"])

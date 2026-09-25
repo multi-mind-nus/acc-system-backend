@@ -148,7 +148,7 @@ def amount_reconciled(relation):
 
 def call_agent(body):
     request = Request(settings.agent_url + "/v1/analyze", data=body.model_dump_json().encode(), headers={"Content-Type": "application/json", "Idempotency-Key": f"{body.run_id}:{body.turn}"})
-    with urlopen(request, timeout=180) as response:
+    with urlopen(request, timeout=300) as response:
         raw = response.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             raise ValueError("Response too large")
@@ -167,7 +167,7 @@ def process_review():
             run.status, run.error, run.finished_at = "FAILED", "AGENT_UNAVAILABLE", now
             run.locked_by = run.locked_until = None
             return True
-        run.status, run.locked_by, run.locked_until = "PROCESSING", lease, now + timedelta(seconds=210)
+        run.status, run.locked_by, run.locked_until = "PROCESSING", lease, now + timedelta(seconds=330)
         run.attempts += 1
         snapshot = dict(run.input_snapshot)
         snapshot["turn_attempts"] += 1
