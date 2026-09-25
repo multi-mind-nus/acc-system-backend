@@ -54,9 +54,12 @@ def _run_out(db, item, run):
     from app.review_analysis import authorized_documents
     refs = run.input_snapshot.get("request", {}).get("documents", [])
     documents = authorized_documents(db, item, [UUID(ref["document_id"]) for ref in refs])
+    output = run.output
+    if output and "findings" in output:
+        output = {**output, "findings": [{key: value for key, value in finding.items() if key != "confidence"} for finding in output["findings"]]}
     return ReviewRunOut(
         id=run.id, submission_id=run.submission_id, status=run.status, model_version=run.model_version,
-        error=run.error, created_at=run.created_at, finished_at=run.finished_at, output=run.output,
+        error=run.error, created_at=run.created_at, finished_at=run.finished_at, output=output,
         documents=[{"id": str(doc.id), "name": doc.original_name, "content_type": doc.content_type, "scope": ref["scope"]} for ref in refs if (doc := documents.get(UUID(ref["document_id"])))],
         searches=run.input_snapshot.get("search_results", []),
     )

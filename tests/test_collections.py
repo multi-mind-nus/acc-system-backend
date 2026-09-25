@@ -341,15 +341,17 @@ def test_ai_policy_defaults_validation_copy_and_draft_guard(records):
         assert created.status_code == 201, created.text
         item = created.json()
         assert item["ai_mode"] == "AUTO_REVIEW"
+        assert item["review_preference"] == "STANDARD"
         assert Decimal(item["ai_satisfy_threshold"]) == Decimal("0.980")
         assert Decimal(item["ai_request_action_threshold"]) == Decimal("0.980")
         path = f"/api/v1/collection-requests/{item['id']}"
-        for changes in ({"ai_mode": "UNKNOWN"}, {"ai_mode": None}, {"ai_satisfy_threshold": "0.499"}, {"ai_request_action_threshold": "1.001"}, {"ai_satisfy_threshold": "NaN"}, {"ai_satisfy_threshold": "0.9999"}):
+        for changes in ({"ai_mode": "UNKNOWN"}, {"ai_mode": None}, {"review_preference": "UNKNOWN"}, {"review_preference": None}, {"ai_satisfy_threshold": "0.499"}, {"ai_request_action_threshold": "1.001"}, {"ai_satisfy_threshold": "NaN"}, {"ai_satisfy_threshold": "0.9999"}):
             assert client.patch(path, headers=headers, json={"version": item["version"], **changes}).status_code == 422
-        updated = client.patch(path, headers=headers, json={"version": item["version"], "ai_mode": "SUGGEST", "ai_satisfy_threshold": "0.995"}).json()
+        updated = client.patch(path, headers=headers, json={"version": item["version"], "ai_mode": "SUGGEST", "review_preference": "CAUTIOUS", "ai_satisfy_threshold": "0.995"}).json()
         copied = client.post(path + "/copy", params={"period": "2026-10-01"}, headers=idempotent(headers, "ai-copy-1"))
         assert copied.status_code == 201, copied.text
         assert copied.json()["ai_mode"] == "SUGGEST"
+        assert copied.json()["review_preference"] == "CAUTIOUS"
         assert Decimal(copied.json()["ai_satisfy_threshold"]) == Decimal("0.995")
         published = client.post(path + "/publish", headers=idempotent(headers, "ai-publish"), json={"version": updated["version"]})
         assert published.status_code == 200, published.text

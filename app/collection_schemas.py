@@ -14,6 +14,7 @@ RequirementStatus = Literal[
     "PENDING", "RECEIVED", "NEEDS_ACTION", "SATISFIED", "WAIVED",
 ]
 AIMode = Literal["OFF", "SUGGEST", "AUTO_REVIEW"]
+ReviewPreference = Literal["CAUTIOUS", "STANDARD", "EFFICIENT"]
 AIThreshold = Annotated[Decimal, Field(ge=Decimal("0.500"), le=Decimal("1.000"), max_digits=4, decimal_places=3)]
 AnalysisType = Literal["DOCUMENT_REQUIREMENT_VALIDATION", "BANK_TRANSACTION_RECONCILIATION"]
 
@@ -55,6 +56,7 @@ class CollectionCreate(BaseModel):
     scope_note: str | None = Field(default=None, max_length=4000)
     assignee_id: UUID | None = None
     ai_mode: AIMode = "AUTO_REVIEW"
+    review_preference: ReviewPreference = "STANDARD"
     ai_satisfy_threshold: AIThreshold = Decimal("0.980")
     ai_request_action_threshold: AIThreshold = Decimal("0.980")
     requirements: list[RequirementInput] = Field(min_length=1, max_length=100)
@@ -82,12 +84,13 @@ class CollectionUpdate(BaseModel):
     scope_note: str | None = Field(default=None, max_length=4000)
     assignee_id: UUID | None = None
     ai_mode: AIMode | None = None
+    review_preference: ReviewPreference | None = None
     ai_satisfy_threshold: AIThreshold | None = None
     ai_request_action_threshold: AIThreshold | None = None
 
     @model_validator(mode="after")
     def require_change(self):
-        for field in ("ai_mode", "ai_satisfy_threshold", "ai_request_action_threshold"):
+        for field in ("ai_mode", "review_preference", "ai_satisfy_threshold", "ai_request_action_threshold"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
         if not (self.model_fields_set - {"version"}):
@@ -129,6 +132,7 @@ class WorkflowEventOut(BaseModel):
 
 class CollectionDetailOut(CollectionSummaryOut):
     ai_mode: AIMode
+    review_preference: ReviewPreference
     ai_satisfy_threshold: AIThreshold
     ai_request_action_threshold: AIThreshold
     requirements: list[RequirementOut]

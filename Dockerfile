@@ -1,6 +1,4 @@
-FROM ghcr.io/astral-sh/uv:0.12.6 AS uv
-
-FROM python:3.12.11-slim
+FROM ghcr.io/astral-sh/uv:0.12.18-python3.12-trixie-slim
 
 ARG APP_VERSION=dev
 
@@ -12,8 +10,6 @@ ENV APP_VERSION=${APP_VERSION} \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
-
-COPY --from=uv /uv /uvx /bin/
 
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home app \

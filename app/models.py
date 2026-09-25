@@ -224,6 +224,7 @@ class CollectionRequest(Base):
     __tablename__ = "collection_requests"
     __table_args__ = (
         CheckConstraint("ai_mode IN ('OFF', 'SUGGEST', 'AUTO_REVIEW')", name="ck_collection_ai_mode"),
+        CheckConstraint("review_preference IN ('CAUTIOUS', 'STANDARD', 'EFFICIENT')", name="ck_collection_review_preference"),
         CheckConstraint("ai_satisfy_threshold BETWEEN 0.500 AND 1.000 AND ai_request_action_threshold BETWEEN 0.500 AND 1.000", name="ck_collection_ai_thresholds"),
         ForeignKeyConstraint(
             ["firm_id", "client_id"], ["clients.firm_id", "clients.id"]
@@ -254,6 +255,7 @@ class CollectionRequest(Base):
     status: Mapped[str] = mapped_column(String(32), default="DRAFT")
     scope_note: Mapped[str | None] = mapped_column(Text)
     ai_mode: Mapped[str] = mapped_column(String(16), default="AUTO_REVIEW", server_default="AUTO_REVIEW")
+    review_preference: Mapped[str] = mapped_column(String(16), default="STANDARD", server_default="STANDARD")
     ai_satisfy_threshold: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal("0.980"), server_default="0.980")
     ai_request_action_threshold: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal("0.980"), server_default="0.980")
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)

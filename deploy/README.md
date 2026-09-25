@@ -48,12 +48,14 @@ Run commands from the `deploy/` directory. Set `JWT_SECRET` to a random value (f
 
 ## Agent baseline (B6.1 + A1)
 
-For **B6.4/F7.3 post-submission review** also set `AGENT_REVIEW_PROVIDER=MOCK` locally. Build Backend with version `b6.4-f7.3-local` and restart backend and worker; rebuild Agent only when its code changes. Submitted requests create REVIEW runs; `AUTO_REVIEW` automatically returns high-confidence issues and marks high-confidence passes satisfied, but the whole request still requires accountant confirmation; `SUGGEST` only records suggestions, and `OFF` creates none. Waiver and final approval remain manual. Real model integration requires REVIEW_PROVIDER=REMOTE plus the Agent README contract. Never enable MOCK in production. No new database revision is required after `0010_classification_confirmation`.
+For **B6.4/F7.3 post-submission review** also set `AGENT_REVIEW_PROVIDER=MOCK` locally. Build Backend with version `b6.4-f7.3-local` and restart backend and worker; rebuild Agent only when its code changes. Submitted requests create REVIEW runs; `AUTO_REVIEW` automatically returns high-confidence issues and marks high-confidence passes satisfied, but the whole request still requires accountant confirmation; `SUGGEST` only records suggestions, and `OFF` creates none. Waiver and final approval remain manual. For Novita inference use `AGENT_REVIEW_PROVIDER=DEEPSEEK`; `REMOTE` remains the separate provisional custom-model contract. Never enable MOCK in production. No new database revision is required after `0010_classification_confirmation`.
 
 For the current **B6.2/A2 UI acceptance** on a local development stack, additionally set `AGENT_CLASSIFICATION_PROVIDER=MOCK` and keep `ENVIRONMENT=development`. Rebuild backend and Agent, run `docker compose --env-file deploy/.env.prod -f deploy/compose.yml up -d backend worker agent`, then reload Nginx if its upstream container IP changed. Agent MOCK readiness is healthy without credentials; the UI explicitly labels simulated results. Production defaults to DISABLED and rejects MOCK. No trained-model accuracy is claimed. `REMOTE` requires the provisional contract in the Agent README to be adapted to the actual provider.
 
 `AGENT_IMAGE` defaults to `acc-system-agent:local`; `AGENT_URL` defaults to `http://agent:8000`.
-Only Agent receives `MODEL_API_URL`, `MODEL_HEALTH_URL` and `MODEL_API_KEY`. No model key is needed for local baseline acceptance. Its `/health/live` returns 200 while `/health/ready` returns `503 MODEL_NOT_CONFIGURED` until a real provider is configured. Backend readiness does not depend on Agent or the model.
+
+For Novita OCR→Flash, use the updated Agent image and set `NOVITA_API_KEY` in the ignored `deploy/.env.prod`; keep `MODEL_API_KEY`/`OCR_API_KEY` empty unless intentionally overriding the shared credential. Set `AGENT_CLASSIFICATION_PROVIDER=DEEPSEEK` and `AGENT_REVIEW_PROVIDER=DEEPSEEK` only when ready to process real jobs. Defaults remain disabled. The Agent uses Novita's `deepseek/deepseek-ocr-2` for every image/PDF page and `deepseek/deepseek-v4.1-flash` for structured classification/review. Do not place provider keys in Compose YAML or GitHub variables visible to untrusted workflows.
+Only Agent receives `NOVITA_API_KEY`, optional `OCR_*` and `MODEL_*` provider settings. No model key is needed for local MOCK acceptance. Its `/health/live` returns 200 while `/health/ready` returns 503 if a selected real provider is unconfigured or unavailable. Backend readiness does not depend on Agent or the model.
 
 Agent uses UID 10001, a read-only root filesystem and read-only documents volume, with no host port or database/Redis credentials. The Compose `internal` network is a private bridge with outbound connectivity, allowing the future remote model connection.
 
@@ -79,10 +81,10 @@ The backend is reachable only on the Compose network and trusts the forwarding h
 
 ## TLS (required for public production)
 
-1. Put `fullchain.pem` and `privkey.pem` in `deploy/certs/`.
-2. Copy `nginx/tls/https.conf.example` to `nginx/tls/runtime/https.conf` and set the domain.
+1. Obtain the first certificate with Certbot's standalone HTTP challenge, mounting `deploy/certs/` as `/etc/letsencrypt`. Stop Nginx briefly while Certbot binds port 80, and start it again even if issuance fails.
+2. Copy `nginx/tls/https.conf.example` to `nginx/tls/runtime/https.conf` and replace `example.com` with the domain. Mount `deploy/acme/` for subsequent webroot renewals. The certificate and private key stay outside the image.
 3. Set `FRONTEND_ORIGIN=https://your-domain` and `COOKIE_SECURE=true` in `.env.prod`. Use `COOKIE_SECURE=false` only for local or restricted HTTP acceptance.
-4. Block public HTTP access or redirect it to HTTPS at the entry point; the base HTTP listener is retained for local acceptance and health checks.
+4. The domain-specific Nginx server redirects HTTP to HTTPS. The default HTTP listener remains for local health checks. For a Cloudflare-proxied domain, select **Full (strict)** in Cloudflare SSL/TLS settings so it validates the origin certificate.
 5. Start with both Compose files:
 
 ```bash
@@ -90,6 +92,7 @@ docker compose --env-file .env.prod -f compose.yml -f compose.tls.yml up -d
 ```
 
 Certificate renewal is owned by the server or an external load balancer; private keys are never built into the Nginx image.
+For the Folio Lightsail server, configure the certificate's renewal method as webroot, then run `renew-tls.sh` daily from root's crontab. It renews only when fewer than 30 days remain and reloads Nginx without stopping the website. The deployed root crontab runs it at `18:17 UTC` and records output in `/var/log/folio-tls-renew.log`.
 
 ## Release
 

@@ -124,6 +124,7 @@ def _detail(db, item: CollectionRequest) -> CollectionDetailOut:
     requirements = _requirements(db, item.id)
     return CollectionDetailOut(
         ai_mode=item.ai_mode,
+        review_preference=item.review_preference,
         ai_satisfy_threshold=item.ai_satisfy_threshold,
         ai_request_action_threshold=item.ai_request_action_threshold,
         **_summary(
@@ -365,6 +366,7 @@ def create_collection(
         due_at=body.due_at,
         scope_note=body.scope_note,
         ai_mode=body.ai_mode,
+        review_preference=body.review_preference,
         ai_satisfy_threshold=body.ai_satisfy_threshold,
         ai_request_action_threshold=body.ai_request_action_threshold,
         created_by=principal.user.id,
@@ -514,6 +516,7 @@ def copy_collection(
         due_at=_shift_due_at(source.due_at, month_delta),
         scope_note=source.scope_note,
         ai_mode=source.ai_mode,
+        review_preference=source.review_preference,
         ai_satisfy_threshold=source.ai_satisfy_threshold,
         ai_request_action_threshold=source.ai_request_action_threshold,
         created_by=principal.user.id,

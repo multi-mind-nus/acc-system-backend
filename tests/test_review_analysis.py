@@ -17,7 +17,7 @@ from test_portal import clean_state, records, auth_headers, upload  # noqa: F401
 
 def response(body):
     return {"schema_version": "1", "run_id": str(body.run_id), "model_version": "test-review-v1", "extractions": [{"document_id": str(d.document_id), "entity_name": "First Client", "period": "2026-09-01", "amount": "10.00", "currency": "SGD"} for d in body.documents],
-        "findings": [{"requirement_id": str(r.id), "action": "ESCALATE", "suggested_decision": None, "issue_code": None, "confidence": 0.5, "entity_check": "UNKNOWN", "period_check": "UNKNOWN", "explanation": "Manual verification required", "client_message": None, "evidence": [{"document_id": str(d.document_id), "relation": "REFERENCE", "reason": "Check source"} for d in body.documents], "amounts": []} for r in body.requirements]}
+        "findings": [{"requirement_id": str(r.id), "action": "ESCALATE", "suggested_decision": None, "issue_code": None, "entity_check": "UNKNOWN", "period_check": "UNKNOWN", "explanation": "Manual verification required", "client_message": None, "evidence": [{"document_id": str(d.document_id), "relation": "REFERENCE", "reason": "Check source"} for d in body.documents], "amounts": []} for r in body.requirements]}
 
 
 def automatic_response(body, requirement_id, decision):
@@ -30,12 +30,11 @@ def automatic_response(body, requirement_id, decision):
             action="RESOLVE" if decision == "SATISFY" else "ASK_CLIENT",
             suggested_decision=decision,
             issue_code=None if decision == "SATISFY" else "WRONG_PERIOD",
-            confidence=0.99,
             entity_check="MATCH",
             period_check="MATCH" if decision == "SATISFY" else "MISMATCH",
             explanation="Validated automatically",
             client_message=None if decision == "SATISFY" else "Please upload the correct period.",
-            evidence=[] if decision == "REQUEST_ACTION" else [{"document_id": str(document.document_id), "relation": "SUPPORTS", "reason": "Matches the request"}],
+            evidence=[{"document_id": str(document.document_id), "relation": "CONTRADICTS" if decision == "REQUEST_ACTION" else "SUPPORTS", "reason": "Period differs" if decision == "REQUEST_ACTION" else "Matches the request"}],
         )
     return result
 
@@ -62,6 +61,7 @@ def test_review_snapshots_company_context_and_only_active_owned_banks(records, m
         company.industry = 'TRADING_DISTRIBUTION'
         company.base_currency = 'USD'
         company.features = {'multi_currency': True, 'has_loan': True}
+        db.get(CollectionRequest, records['request']).review_preference = 'CAUTIOUS'
         other = db.scalars(select(Client).where(Client.id != company.id)).first()
         for owner, bank, status in [(company, 'DBS', 'ACTIVE'), (company, 'Disabled bank', 'DISABLED'), (other, 'Other client bank', 'ACTIVE')]:
             db.add(ClientBankAccount(firm_id=owner.firm_id, client_id=owner.id, bank=bank, account_last4='1234', currency='USD', status=status))
@@ -77,6 +77,7 @@ def test_review_snapshots_company_context_and_only_active_owned_banks(records, m
         db.get(Client, records['first']).base_currency = 'SGD'
     def check_snapshot(body):
         assert body.context.base_currency == 'USD'
+        assert body.review_preference == 'CAUTIOUS'
         return response(body)
     monkeypatch.setattr('app.review_analysis.call_agent', check_snapshot)
     assert process_review()
@@ -89,9 +90,13 @@ def test_submit_analysis_is_advisory_private_and_idempotent(records, monkeypatch
         assert process_review()
         assert not process_review()
         path = f"/api/v1/collection-requests/{records['request']}/review-runs"
+        with SessionLocal.begin() as db:
+            run = db.scalar(select(AIRun).where(AIRun.purpose == "REVIEW"))
+            run.output = {**run.output, "findings": [{**finding, "confidence": 0.5} for finding in run.output["findings"]]}
         result = client.get(path, headers=staff).json()[0]
         assert result["status"] == "SUCCEEDED"
-        assert result["output"]["findings"][0]["manual_reasons"] == ["ESCALATED", "LOW_CONFIDENCE", "MANUAL_REVIEW_REQUIRED"]
+        assert all("confidence" not in finding for finding in result["output"]["findings"])
+        assert result["output"]["findings"][0]["manual_reasons"] == ["ESCALATED", "MANUAL_REVIEW_REQUIRED"]
         assert "storage_key" not in str(result)
         assert client.get(path, headers=portal).status_code == 403
         public = client.get(f"/api/v1/portal/collection-requests/{records['request']}", headers=portal).json()
@@ -134,6 +139,14 @@ def test_auto_review_returns_failed_item_to_client(records, monkeypatch):
         assert process_next_document()
         resubmitted = client.post(f"/api/v1/portal/collection-requests/{records['request']}/submit", headers=portal)
         assert resubmitted.status_code == 200 and resubmitted.json()["status"] == "IN_REVIEW"
+        assert process_review()
+        with SessionLocal() as db:
+            assert db.get(CollectionRequest, records["request"]).status == "IN_REVIEW"
+            assert db.get(Requirement, records["required"]).status == "RECEIVED"
+            assert len(list(db.scalars(select(ReviewDecision)))) == 1
+            latest_run = db.scalar(select(AIRun).where(AIRun.purpose == "REVIEW").order_by(AIRun.created_at.desc()).limit(1))
+            finding = next(value for value in latest_run.output["findings"] if value["requirement_id"] == str(records["required"]))
+            assert "INSUFFICIENT_EVIDENCE" in finding["manual_reasons"]
 
 
 def test_auto_review_passes_items_but_waits_for_whole_request_confirmation(records, monkeypatch):
@@ -172,12 +185,10 @@ def test_auto_review_passes_items_but_waits_for_whole_request_confirmation(recor
         assert approved.status_code == 200 and approved.json()["status"] == "READY_FOR_BOOKKEEPING"
 
 
-@pytest.mark.parametrize("mode,threshold", [("SUGGEST", "0.980"), ("AUTO_REVIEW", "1.000")])
-def test_auto_review_respects_mode_and_threshold(records, monkeypatch, mode, threshold):
+def test_suggest_mode_never_applies_agent_decision(records, monkeypatch):
     with SessionLocal.begin() as db:
         item = db.get(CollectionRequest, records["request"])
-        item.ai_mode = mode
-        item.ai_request_action_threshold = threshold
+        item.ai_mode = "SUGGEST"
     monkeypatch.setattr("app.review_analysis.call_agent", lambda body: automatic_response(body, records["required"], "REQUEST_ACTION"))
     with TestClient(app) as client:
         submitted(client, records)
@@ -185,6 +196,37 @@ def test_auto_review_respects_mode_and_threshold(records, monkeypatch, mode, thr
         with SessionLocal() as db:
             assert not db.scalar(select(ReviewDecision))
             assert db.get(Requirement, records["required"]).status == "RECEIVED"
+
+
+def test_review_rejects_removed_confidence_field(records, monkeypatch):
+    def agent(body):
+        result = automatic_response(body, records["required"], "REQUEST_ACTION")
+        for finding in result["findings"]:
+            finding["confidence"] = 0.01
+        return result
+    monkeypatch.setattr("app.review_analysis.call_agent", agent)
+    with TestClient(app) as client:
+        submitted(client, records)
+        assert process_review()
+        with SessionLocal() as db:
+            assert db.get(Requirement, records["required"]).status == "RECEIVED"
+            assert db.scalar(select(ReviewDecision)) is None
+            assert db.scalar(select(AIRun).where(AIRun.purpose == "REVIEW")).error == "AGENT_INVALID_RESPONSE"
+
+
+def test_unsubstantiated_mismatch_remains_manual(records, monkeypatch):
+    def agent(body):
+        result = automatic_response(body, records["required"], "REQUEST_ACTION")
+        finding = next(value for value in result["findings"] if value["requirement_id"] == str(records["required"]))
+        finding["evidence"] = []
+        return result
+    monkeypatch.setattr("app.review_analysis.call_agent", agent)
+    with TestClient(app) as client:
+        submitted(client, records)
+        assert process_review()
+        with SessionLocal() as db:
+            assert db.get(Requirement, records["required"]).status == "RECEIVED"
+            assert not db.scalar(select(ReviewDecision))
 
 
 @pytest.mark.parametrize("failure", ["timeout", "evidence", "run_id", "schema", "search_limit", "stale"])
@@ -208,7 +250,7 @@ def test_failures_retry_and_stale_results(records, monkeypatch, failure):
     monkeypatch.setattr("app.review_analysis.call_agent", agent)
     with TestClient(app) as client:
         _, staff = submitted(client, records)
-        iterations = 3 if failure == "timeout" else 4 if failure == "search_limit" else 1
+        iterations = 3 if failure == "timeout" else 2 if failure == "search_limit" else 1
         for _ in range(iterations):
             with SessionLocal.begin() as db:
                 run = db.scalar(select(AIRun).where(AIRun.purpose == "REVIEW"))
@@ -293,7 +335,7 @@ def test_history_search_is_scoped_and_lease_can_be_reclaimed(records, monkeypatc
         def agent(body):
             result = response(body)
             if not body.turn:
-                result.update(findings=[], search={"action": "SEARCH_HISTORY", "requirement_id": str(body.requirements[0].id), "query": "B03"})
+                result.update(findings=[], search={"action": "SEARCH_HISTORY", "requirement_id": str(body.requirements[0].id), "query": "not-yet-indexed"})
             else:
                 assert [str(d.document_id) for d in body.documents if d.scope == "HISTORY"] == [history_id]
             return result

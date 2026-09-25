@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     clamav_host: str | None = None
     clamav_port: int = 3310
     agent_url: str = "http://agent:8000"
-    agent_classification_provider: Literal["DISABLED", "MOCK", "REMOTE"] = "DISABLED"
+    agent_classification_provider: Literal["DISABLED", "MOCK", "REMOTE", "DEEPSEEK"] = "DISABLED"
     jwt_secret: SecretStr = SecretStr("local-development-only-change-me")
     jwt_issuer: str = "acc-system"
     jwt_audience: str = "acc-system-web"

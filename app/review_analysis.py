@@ -18,8 +18,11 @@ from app.models import (
 from app.notifications import add_workflow_event
 
 
-def file_reference(doc, requirement_ids=(), scope="CURRENT"):
-    return {"document_id": str(doc.id), "storage_key": doc.storage_key, "content_type": doc.content_type, "sha256": doc.sha256, "original_name": doc.original_name, "requirement_ids": [str(id) for id in requirement_ids], "scope": scope}
+def file_reference(doc, requirement_ids=(), scope="CURRENT", submission_round=None):
+    return {"document_id": str(doc.id), "storage_key": doc.storage_key, "content_type": doc.content_type,
+            "document_type": doc.document_type, "submission_round": submission_round,
+            "sha256": doc.sha256, "original_name": doc.original_name,
+            "requirement_ids": [str(id) for id in requirement_ids], "scope": scope}
 
 
 def collection_review_status(db, item, requirements=None, submission=None):
@@ -58,13 +61,14 @@ def enqueue_review(db, item, submission, user_id):
         .join(Submission, Submission.id == RequirementDocument.submission_id)
         .where(RequirementDocument.request_id == item.id, Submission.status == "SUBMITTED", Submission.round_no <= submission.round_no)
         .order_by(Submission.round_no, RequirementDocument.created_at)).all()
-    effective = {(link.requirement_id, doc.id): (link, doc) for link, doc, _ in rows}
+    effective = {(link.requirement_id, doc.id): (link, doc, submitted) for link, doc, submitted in rows}
     files = {}
     sizes = {}
-    for link, doc in effective.values():
+    for link, doc, submitted in effective.values():
         if link.excluded_at or doc.status != "AVAILABLE" or doc.firm_id != item.firm_id or doc.client_id != item.client_id:
             continue
-        ref = files.setdefault(doc.id, file_reference(doc))
+        ref = files.setdefault(doc.id, file_reference(doc, submission_round=submitted.round_no))
+        ref["submission_round"] = max(ref["submission_round"], submitted.round_no)
         sizes[doc.id] = doc.size_bytes
         if link.requirement_id:
             ref["requirement_ids"].append(str(link.requirement_id))
@@ -72,6 +76,7 @@ def enqueue_review(db, item, submission, user_id):
     client = db.scalars(select(Client).where(Client.id == item.client_id, Client.firm_id == item.firm_id)).one()
     banks = db.scalars(select(ClientBankAccount).where(ClientBankAccount.client_id == item.client_id, ClientBankAccount.firm_id == item.firm_id, ClientBankAccount.status == "ACTIVE").order_by(ClientBankAccount.id)).all()
     payload = {"schema_version": "1", "run_id": str(run.id), "purpose": "REVIEW", "turn": 0,
+        "review_preference": item.review_preference,
         "context": {"entity_name": client.legal_name, "period": item.period.isoformat(), "submission_id": str(submission.id),
             "industry": client.industry, "base_currency": client.base_currency, "features": client.features,
             "bank_accounts": [{"bank": bank.bank, "account_last4": bank.account_last4, "currency": bank.currency} for bank in banks]},
@@ -104,6 +109,7 @@ def search_documents(db, item, search, known_ids):
         statement = statement.where(CollectionRequest.period < item.period)
     else:
         statement = statement.where(CollectionRequest.id == item.id)
+    scoped = statement
     if search.period:
         statement = statement.where(CollectionRequest.period == search.period)
     if search.document_type:
@@ -114,7 +120,12 @@ def search_documents(db, item, search, known_ids):
         statement = statement.where(Document.extracted_data["amount"].astext == search.amount)
     if search.currency:
         statement = statement.where(Document.extracted_data["currency"].astext == search.currency)
-    return list(db.scalars(statement.distinct().order_by(Document.created_at.desc(), Document.id).limit(min(20, 100-len(known_ids)))))
+    limit = min(20, 100-len(known_ids))
+    found = list(db.scalars(statement.distinct().order_by(Document.created_at.desc(), Document.id).limit(limit)))
+    if found or not any((search.period, search.document_type, search.query, search.amount, search.currency)):
+        return found
+    # Search metadata can be incomplete before OCR extraction; retry within the same authorized client/scope.
+    return list(db.scalars(scoped.distinct().order_by(Document.created_at.desc(), Document.id).limit(limit)))
 
 
 def amount_valid(relation):
@@ -128,6 +139,11 @@ def amount_valid(relation):
             for value in amounts[1:]:
                 actual *= value
         return actual == Decimal(relation.actual_amount) and actual - Decimal(relation.expected_amount) == Decimal(relation.difference)
+
+
+def amount_reconciled(relation):
+    # Up to half a cent is allowed for a single rounded monetary conversion.
+    return abs(Decimal(relation.difference)) <= Decimal("0.005")
 
 
 def call_agent(body):
@@ -205,14 +221,23 @@ def process_review():
             ).with_for_update())}
             auto_returned = []
             for finding, row in zip(result.findings, output["findings"], strict=True):
-                threshold = item.ai_satisfy_threshold if finding.suggested_decision == "SATISFY" else item.ai_request_action_threshold
                 row["manual_reasons"] = []
                 if finding.action == "ESCALATE":
                     row["manual_reasons"].append("ESCALATED")
-                if Decimal(str(finding.confidence)) < threshold:
-                    row["manual_reasons"].append("LOW_CONFIDENCE")
+                if finding.action == "ASK_CLIENT" and finding.issue_code in ("WRONG_PERIOD", "ENTITY_MISMATCH"):
+                    check = finding.period_check if finding.issue_code == "WRONG_PERIOD" else finding.entity_check
+                    current = [doc for doc in body.documents if finding.requirement_id in doc.requirement_ids and doc.submission_round]
+                    latest_round = max((doc.submission_round for doc in current), default=None)
+                    latest_ids = {doc.document_id for doc in current if doc.submission_round == latest_round}
+                    if check != "MISMATCH" or not any(value.relation == "CONTRADICTS" and value.document_id in latest_ids for value in finding.evidence):
+                        row["manual_reasons"].append("INSUFFICIENT_EVIDENCE")
+                if finding.action == "ASK_CLIENT" and finding.issue_code in ("MISSING", "INCOMPLETE") and not body.search_history:
+                    row["manual_reasons"].append("INSUFFICIENT_EVIDENCE")
+                if finding.action == "ASK_CLIENT" and finding.issue_code in ("UNREADABLE", "OTHER"):
+                    row["manual_reasons"].append("INSUFFICIENT_EVIDENCE")
                 row["amounts_valid"] = all(amount_valid(relation) for relation in finding.amounts)
-                if not row["amounts_valid"]:
+                if not row["amounts_valid"] or (finding.suggested_decision == "SATISFY"
+                        and not all(amount_reconciled(relation) for relation in finding.amounts)):
                     row["manual_reasons"].append("AMOUNT_MISMATCH")
                 requirement = requirements[finding.requirement_id]
                 can_apply = (
