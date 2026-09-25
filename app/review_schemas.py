@@ -104,6 +104,7 @@ class ReviewSubmissionOut(BaseModel):
 
 
 class ReviewCollectionOut(BaseModel):
+    review_status: Literal["PROCESSING", "AI_PASSED", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT"] | None = None
     id: UUID
     client_id: UUID
     client_name: str

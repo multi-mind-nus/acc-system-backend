@@ -345,6 +345,7 @@ def create_client(
         code=payload.code.upper(),
         legal_name=payload.legal_name.strip(),
         base_currency=payload.base_currency,
+        industry=payload.industry,
         features=payload.features.model_dump(),
     )
     db.add(client)

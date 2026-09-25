@@ -139,6 +139,9 @@ class ClientFeatures(BaseModel):
     has_retention: bool = False
 
 
+Industry = Literal["PROFESSIONAL_SERVICES", "ONLINE_COMMERCE", "PROJECT_ENGINEERING", "TRADING_DISTRIBUTION", "FOOD_BEVERAGE", "SOFTWARE_SAAS", "OTHER"]
+
+
 class ClientCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -146,9 +149,11 @@ class ClientCreate(BaseModel):
     legal_name: str = Field(min_length=1, max_length=200)
     base_currency: str = Field(default="SGD", pattern=r"^[A-Z]{3}$")
     features: ClientFeatures = Field(default_factory=ClientFeatures)
+    industry: Industry = "OTHER"
 
 
 class ClientUpdate(BaseModel):
+    industry: Industry = "OTHER"
     model_config = ConfigDict(str_strip_whitespace=True)
 
     legal_name: str | None = Field(default=None, min_length=1, max_length=200)
@@ -164,6 +169,7 @@ class ClientUpdate(BaseModel):
 
 
 class ClientOut(BaseModel):
+    industry: Industry
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID

@@ -123,6 +123,8 @@ def _document_out(link, document, submission) -> ReviewDocumentOut:
 
 
 def _review_detail(db, item: CollectionRequest) -> ReviewCollectionOut:
+    from app.review_analysis import collection_review_status
+
     requirements = list(db.scalars(
         select(Requirement)
         .where(Requirement.request_id == item.id)
@@ -189,6 +191,7 @@ def _review_detail(db, item: CollectionRequest) -> ReviewCollectionOut:
         period=item.period,
         due_at=item.due_at,
         status=item.status,
+        review_status=collection_review_status(db, item, requirements=requirements),
         version=item.version,
         assignee_name=db.get(User, item.assignee_id).name,
         requirements=[ReviewRequirementOut(
@@ -403,26 +406,6 @@ def reopen(
     return _finish(db, record, item)
 
 
-@router.post(
-    "/collection-requests/{request_id}/close",
-    response_model=ReviewCollectionOut,
-)
-def close(
-    request_id: UUID, body: TransitionInput, db: DbSession, principal: Staff,
-    idempotency_key: IdempotencyKey,
-):
-    path = f"/collection-requests/{request_id}/close"
-    record, replay, item = _start_transition(
-        db, principal, idempotency_key, path, body, request_id
-    )
-    if replay:
-        return replay
-    _check_request_version(item, body.version, db)
-    if item.status != "READY_FOR_BOOKKEEPING":
-        raise APIError(409, "INVALID_TRANSITION", "Only an approved request can be closed")
-    item.status = "CLOSED"
-    _event(db, principal, item, "CLOSED", {"reason": body.reason})
-    return _finish(db, record, item)
 
 
 @router.get("/documents/{document_id}/download")

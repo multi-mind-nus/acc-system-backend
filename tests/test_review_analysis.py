@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.analysis_schemas import AmountRelation
 from app.db import SessionLocal
 from app.main import app
-from app.models import AIRun, Client, CollectionRequest, Document, Firm, FirmMember, Notification, NotificationOutbox, Requirement, RequirementDocument, ReviewDecision, Submission, User, WorkflowEvent
+from app.models import AIRun, Client, ClientBankAccount, CollectionRequest, Document, Firm, FirmMember, Notification, NotificationOutbox, Requirement, RequirementDocument, ReviewDecision, Submission, User, WorkflowEvent
 from app.review_analysis import amount_valid, authorized_documents, process_review
 from app.worker import process_next_document
 from test_portal import clean_state, records, auth_headers, upload  # noqa: F401
@@ -54,6 +54,34 @@ def submitted(client, records):
     return portal, staff
 
 
+def test_review_snapshots_company_context_and_only_active_owned_banks(records, monkeypatch):
+    from app.analysis_schemas import ReviewRequest
+
+    with SessionLocal.begin() as db:
+        company = db.get(Client, records['first'])
+        company.industry = 'TRADING_DISTRIBUTION'
+        company.base_currency = 'USD'
+        company.features = {'multi_currency': True, 'has_loan': True}
+        other = db.scalars(select(Client).where(Client.id != company.id)).first()
+        for owner, bank, status in [(company, 'DBS', 'ACTIVE'), (company, 'Disabled bank', 'DISABLED'), (other, 'Other client bank', 'ACTIVE')]:
+            db.add(ClientBankAccount(firm_id=owner.firm_id, client_id=owner.id, bank=bank, account_last4='1234', currency='USD', status=status))
+    with TestClient(app) as client:
+        submitted(client, records)
+    with SessionLocal.begin() as db:
+        run = db.scalars(select(AIRun).where(AIRun.purpose == 'REVIEW')).one()
+        context = ReviewRequest.model_validate(run.input_snapshot['request']).context
+        assert context.industry == 'TRADING_DISTRIBUTION'
+        assert context.base_currency == 'USD'
+        assert context.features.multi_currency and context.features.has_loan
+        assert [b.model_dump() for b in context.bank_accounts] == [{'bank': 'DBS', 'account_last4': '1234', 'currency': 'USD'}]
+        db.get(Client, records['first']).base_currency = 'SGD'
+    def check_snapshot(body):
+        assert body.context.base_currency == 'USD'
+        return response(body)
+    monkeypatch.setattr('app.review_analysis.call_agent', check_snapshot)
+    assert process_review()
+
+
 def test_submit_analysis_is_advisory_private_and_idempotent(records, monkeypatch):
     monkeypatch.setattr("app.review_analysis.call_agent", response)
     with TestClient(app) as client:
@@ -67,7 +95,14 @@ def test_submit_analysis_is_advisory_private_and_idempotent(records, monkeypatch
         assert "storage_key" not in str(result)
         assert client.get(path, headers=portal).status_code == 403
         public = client.get(f"/api/v1/portal/collection-requests/{records['request']}", headers=portal).json()
-        assert public["review_status"] == "AWAITING_ACCOUNTANT"
+        assert public["review_status"] == "AI_NEEDS_REVIEW"
+        for prefix, headers in [("/api/v1/collection-requests", staff), ("/api/v1/portal/collection-requests", portal)]:
+            matched = client.get(prefix, params={"status": "AI_NEEDS_REVIEW"}, headers=headers)
+            assert matched.status_code == 200, matched.text
+            assert str(records["request"]) in matched.text
+            unmatched = client.get(prefix, params={"status": "PROCESSING"}, headers=headers)
+            assert unmatched.status_code == 200, unmatched.text
+            assert str(records["request"]) not in unmatched.text
         assert "extractions" not in str(public) and "confidence" not in str(public)
         with SessionLocal() as db:
             assert db.get(CollectionRequest, records["request"]).status == "IN_REVIEW"
@@ -186,6 +221,8 @@ def test_failures_retry_and_stale_results(records, monkeypatch, failure):
             assert not db.scalar(select(ReviewDecision))
             assert db.scalar(select(Document)).extracted_data is None
         if failure != "stale":
+            public = client.get(f"/api/v1/collection-requests/{records['request']}", headers=staff).json()
+            assert public["review_status"] == "AI_FAILED"
             monkeypatch.setattr("app.review_analysis.call_agent", response)
             first = client.post(path + f"/{result['id']}/retry", headers=staff)
             assert first.status_code == 200, first.text
@@ -217,7 +254,7 @@ def test_history_search_is_scoped_and_lease_can_be_reclaimed(records, monkeypatc
         with SessionLocal.begin() as db:
             current = db.get(CollectionRequest, records["request"])
             source = db.scalar(select(Document))
-            previous = CollectionRequest(firm_id=current.firm_id, client_id=current.client_id, period=date(2026, 8, 1), due_at=current.due_at, status="CLOSED", created_by=current.created_by, assignee_id=current.assignee_id)
+            previous = CollectionRequest(firm_id=current.firm_id, client_id=current.client_id, period=date(2026, 8, 1), due_at=current.due_at, status="READY_FOR_BOOKKEEPING", created_by=current.created_by, assignee_id=current.assignee_id)
             db.add(previous)
             db.flush()
             sub = Submission(firm_id=current.firm_id, request_id=previous.id, round_no=1, status="SUBMITTED", created_by=current.created_by)
@@ -240,7 +277,7 @@ def test_history_search_is_scoped_and_lease_can_be_reclaimed(records, monkeypatc
             db.flush()
             excluded_ids = []
             for customer, owner in ((other_client, current.created_by), (foreign_client, other_user.id)):
-                foreign_request = CollectionRequest(firm_id=customer.firm_id, client_id=customer.id, period=date(2026, 8, 1), due_at=current.due_at, status="CLOSED", created_by=owner, assignee_id=owner)
+                foreign_request = CollectionRequest(firm_id=customer.firm_id, client_id=customer.id, period=date(2026, 8, 1), due_at=current.due_at, status="READY_FOR_BOOKKEEPING", created_by=owner, assignee_id=owner)
                 db.add(foreign_request)
                 db.flush()
                 foreign_submission = Submission(firm_id=customer.firm_id, request_id=foreign_request.id, round_no=1, status="SUBMITTED", created_by=owner)

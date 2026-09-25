@@ -312,7 +312,7 @@ def list_collections(
     if period:
         statement = statement.where(CollectionRequest.period == period)
     if status:
-        statement = statement.where(CollectionRequest.status == ("IN_REVIEW" if status == "AI_PASSED" else status))
+        statement = statement.where(CollectionRequest.status == ("IN_REVIEW" if status in ("AI_PASSED", "PROCESSING", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT") else status))
     if assignee_id:
         statement = statement.where(CollectionRequest.assignee_id == assignee_id)
     if due_from:
@@ -324,9 +324,9 @@ def list_collections(
         sort_column.desc() if order == "desc" else sort_column.asc(),
         CollectionRequest.id,
     )
-    if status == "AI_PASSED":
+    if status in ("AI_PASSED", "PROCESSING", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT"):
         items = [_summary(db, *row) for row in db.execute(statement).all()]
-        items = [item for item in items if item.review_status == "AI_PASSED"]
+        items = [item for item in items if item.review_status == status]
         total = len(items)
         items = items[(page - 1) * page_size:page * page_size]
     else:
@@ -356,13 +356,6 @@ def create_collection(
     client = ensure_client_access(db, principal, body.client_id)
     if client.status != "ACTIVE":
         raise APIError(409, "CLIENT_DISABLED", "Client is disabled")
-    if db.scalar(select(CollectionRequest.id).where(
-        CollectionRequest.firm_id == principal.firm.id,
-        CollectionRequest.client_id == body.client_id,
-        CollectionRequest.period == body.period,
-        CollectionRequest.status != "CANCELLED",
-    )):
-        raise APIError(409, "COLLECTION_EXISTS", "A request already exists for this period")
     assignee_id = body.assignee_id or principal.user.id
     _validate_assignee(db, principal, body.client_id, assignee_id)
     item = CollectionRequest(
@@ -507,13 +500,6 @@ def copy_collection(
     if replay:
         return replay
     source = _load_request(db, principal, request_id, lock=True)
-    if db.scalar(select(CollectionRequest.id).where(
-        CollectionRequest.firm_id == principal.firm.id,
-        CollectionRequest.client_id == source.client_id,
-        CollectionRequest.period == period,
-        CollectionRequest.status != "CANCELLED",
-    )):
-        raise APIError(409, "COLLECTION_EXISTS", "A request already exists for this period")
     month_delta = (period.year - source.period.year) * 12 + period.month - source.period.month
     assignee_id = source.assignee_id
     try:

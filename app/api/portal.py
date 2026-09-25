@@ -274,15 +274,15 @@ def list_collections(
     if period:
         statement = statement.where(CollectionRequest.period == period)
     if status:
-        statement = statement.where(CollectionRequest.status == ("IN_REVIEW" if status == "AI_PASSED" else status))
+        statement = statement.where(CollectionRequest.status == ("IN_REVIEW" if status in ("AI_PASSED", "PROCESSING", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT") else status))
     sort_column = getattr(CollectionRequest, sort)
     statement = statement.order_by(
         sort_column.desc() if order == "desc" else sort_column.asc(),
         CollectionRequest.id,
     )
     summaries = [_summary(db, item) for item in db.scalars(statement)] if client_ids else []
-    if status == "AI_PASSED":
-        summaries = [item for item in summaries if item.review_status == "AI_PASSED"]
+    if status in ("AI_PASSED", "PROCESSING", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT"):
+        summaries = [item for item in summaries if item.review_status == status]
     return PortalCollectionListOut(items=summaries, total=len(summaries))
 
 

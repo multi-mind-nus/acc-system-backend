@@ -150,7 +150,7 @@ def test_upload_scan_duplicate_exclude_and_submit(records, monkeypatch):
                 client_id=records["first"],
                 period=date(2026, 10, 1),
                 due_at=datetime(2026, 10, 25, tzinfo=UTC),
-                status="CLOSED",
+                status="READY_FOR_BOOKKEEPING",
                 created_by=records["admin"],
                 assignee_id=records["admin"],
                 updated_at=datetime(2026, 11, 1, tzinfo=UTC),
@@ -164,7 +164,7 @@ def test_upload_scan_duplicate_exclude_and_submit(records, monkeypatch):
             params={
                 "client_id": str(records["first"]),
                 "period": "2026-10-01",
-                "status": "CLOSED",
+                "status": "READY_FOR_BOOKKEEPING",
                 "sort": "period",
                 "order": "desc",
             },
@@ -594,8 +594,8 @@ def test_review_changes_resubmit_approve_reopen_and_close(records):
             headers={**admin, "Idempotency-Key": "close-review-1"},
             json={"version": approved_again.json()["version"], "reason": "Books completed"},
         )
-        assert closed.status_code == 200, closed.text
-        assert closed.json()["status"] == "CLOSED"
+        assert closed.status_code == 404, closed.text
+        assert approved_again.json()["status"] == "READY_FOR_BOOKKEEPING"
 
         portal_detail = client.get(
             f"/api/v1/portal/collection-requests/{records['request']}", headers=portal

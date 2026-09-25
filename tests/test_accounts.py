@@ -53,6 +53,20 @@ def admin() -> User:
     return user
 
 
+def test_client_industry_defaults_and_updates(admin):
+    with TestClient(app) as client:
+        headers = bearer(login(client, admin.email, "correct horse battery staple"))
+        response = client.post("/api/v1/clients", headers=headers, json={"code": "IND", "legal_name": "Industry Test"})
+        assert response.status_code == 201
+        assert response.json()["industry"] == "OTHER"
+        url = f'/api/v1/clients/{response.json()["id"]}'
+        assert client.patch(url, headers=headers, json={"industry": "ONLINE_COMMERCE"}).json()["industry"] == "ONLINE_COMMERCE"
+        assert client.patch(url, headers=headers, json={"legal_name": "Renamed"}).json()["industry"] == "ONLINE_COMMERCE"
+        for invalid in [None, "UNKNOWN"]:
+            assert client.patch(url, headers=headers, json={"industry": invalid}).status_code == 422
+        assert client.get(url, headers=headers).json()["industry"] == "ONLINE_COMMERCE"
+
+
 def login(client: TestClient, email: str, password: str) -> dict:
     response = client.post(
         "/api/v1/auth/login", json={"email": email, "password": password}

@@ -234,8 +234,10 @@ def test_versions_publish_idempotency_and_immutable_requirements(records) -> Non
             headers=idempotent(headers, "create-after-cancel-2"),
             json=payload(records["first"], records["accountant"]),
         )
-        assert duplicate.status_code == 409
-        assert duplicate.json()["code"] == "COLLECTION_EXISTS"
+        assert duplicate.status_code == 201, duplicate.text
+        assert duplicate.json()["id"] != recreated.json()["id"]
+        replay = client.post("/api/v1/collection-requests", headers=idempotent(headers, "create-after-cancel-2"), json=payload(records["first"], records["accountant"]))
+        assert replay.json()["id"] == duplicate.json()["id"]
         with SessionLocal() as db:
             assert db.scalar(select(func.count(WorkflowEvent.id)).where(
                 WorkflowEvent.request_id == UUID(request_id),
@@ -269,7 +271,8 @@ def test_copy_and_combined_filters_do_not_leak_tenants(records) -> None:
             headers=idempotent(headers, "copy-next-other-key"),
             params={"period": "2026-10-01"},
         )
-        assert duplicate.status_code == 409
+        assert duplicate.status_code == 201, duplicate.text
+        assert duplicate.json()["id"] != copy_body["id"]
 
         filtered = client.get("/api/v1/collection-requests", headers=headers, params={
             "client_id": str(records["first"]),
@@ -280,8 +283,8 @@ def test_copy_and_combined_filters_do_not_leak_tenants(records) -> None:
             "due_to": "2026-10-31T23:59:59Z",
         })
         assert filtered.status_code == 200
-        assert filtered.json()["total"] == 1
-        assert filtered.json()["items"][0]["id"] == copy_body["id"]
+        assert filtered.json()["total"] == 2
+        assert {row["id"] for row in filtered.json()["items"]} == {copy_body["id"], duplicate.json()["id"]}
 
         with SessionLocal.begin() as db:
             db.get(CollectionRequest, UUID(source["id"])).updated_at = datetime(2026, 11, 2, tzinfo=UTC)
@@ -327,7 +330,7 @@ def test_copy_and_combined_filters_do_not_leak_tenants(records) -> None:
         assert client.get(
             "/api/v1/collection-requests", headers=headers,
             params={"period": "2026-10-01"},
-        ).json()["total"] == 1
+        ).json()["total"] == 2
 
 
 def test_ai_policy_defaults_validation_copy_and_draft_guard(records):

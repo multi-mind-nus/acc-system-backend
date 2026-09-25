@@ -94,6 +94,7 @@ class Client(Base):
     code: Mapped[str] = mapped_column(String(50))
     legal_name: Mapped[str] = mapped_column(String(200))
     base_currency: Mapped[str] = mapped_column(String(3), default="SGD")
+    industry: Mapped[str] = mapped_column(String(40), default="OTHER", server_default="OTHER")
     features: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(
@@ -236,12 +237,10 @@ class CollectionRequest(Base):
             "'READY_FOR_BOOKKEEPING', 'CLOSED', 'CANCELLED')"
         ),
         Index(
-            "uq_collection_requests_active_period",
+            "ix_collection_requests_client_period",
             "firm_id",
             "client_id",
             "period",
-            unique=True,
-            postgresql_where=text("status <> 'CANCELLED'"),
         ),
         UniqueConstraint("firm_id", "id"),
         Index("ix_collection_requests_dashboard", "firm_id", "status", "due_at"),

@@ -7,9 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 CollectionStatus = Literal[
     "DRAFT", "OPEN", "IN_REVIEW", "CHANGES_REQUESTED",
-    "READY_FOR_BOOKKEEPING", "CLOSED", "CANCELLED",
+    "READY_FOR_BOOKKEEPING", "CANCELLED",
 ]
-CollectionFilterStatus = CollectionStatus | Literal["AI_PASSED"]
+CollectionFilterStatus = CollectionStatus | Literal["AI_PASSED", "PROCESSING", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT"]
 RequirementStatus = Literal[
     "PENDING", "RECEIVED", "NEEDS_ACTION", "SATISFIED", "WAIVED",
 ]
@@ -114,7 +114,7 @@ class CollectionSummaryOut(BaseModel):
     assignee_name: str
     requirement_count: int
     updated_at: datetime
-    review_status: Literal["PROCESSING", "AI_PASSED", "AWAITING_ACCOUNTANT"] | None = None
+    review_status: Literal["PROCESSING", "AI_PASSED", "AI_NEEDS_REVIEW", "AI_FAILED", "AWAITING_ACCOUNTANT"] | None = None
 
 
 class WorkflowEventOut(BaseModel):

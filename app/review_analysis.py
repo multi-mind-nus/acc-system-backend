@@ -11,7 +11,7 @@ from app.analysis_schemas import ReviewRequest, validate_review
 from app.config import settings
 from app.db import SessionLocal
 from app.models import (
-    AIRun, Client, ClientMember, CollectionRequest, Document, NotificationOutbox,
+    AIRun, Client, ClientBankAccount, ClientMember, CollectionRequest, Document, NotificationOutbox,
     Requirement, RequirementDocument, ReviewDecision, ReviewDecisionDocument,
     Submission, User,
 )
@@ -41,6 +41,10 @@ def collection_review_status(db, item, requirements=None, submission=None):
             and all(value.get("suggested_decision") == "SATISFY" and not value.get("manual_reasons") for value in findings) \
             and all(requirement.status == "SATISFIED" for requirement in requirements):
         return "AI_PASSED"
+    if run and run.status == "SUCCEEDED":
+        return "AI_NEEDS_REVIEW"
+    if run and run.status in ("FAILED", "CANCELLED"):
+        return "AI_FAILED"
     return "AWAITING_ACCOUNTANT"
 
 
@@ -65,8 +69,12 @@ def enqueue_review(db, item, submission, user_id):
         if link.requirement_id:
             ref["requirement_ids"].append(str(link.requirement_id))
     run = AIRun(id=uuid4(), firm_id=item.firm_id, request_id=item.id, submission_id=submission.id, purpose="REVIEW", status="QUEUED", requested_by=user_id)
+    client = db.scalars(select(Client).where(Client.id == item.client_id, Client.firm_id == item.firm_id)).one()
+    banks = db.scalars(select(ClientBankAccount).where(ClientBankAccount.client_id == item.client_id, ClientBankAccount.firm_id == item.firm_id, ClientBankAccount.status == "ACTIVE").order_by(ClientBankAccount.id)).all()
     payload = {"schema_version": "1", "run_id": str(run.id), "purpose": "REVIEW", "turn": 0,
-        "context": {"entity_name": db.get(Client, item.client_id).legal_name, "period": item.period.isoformat(), "submission_id": str(submission.id)},
+        "context": {"entity_name": client.legal_name, "period": item.period.isoformat(), "submission_id": str(submission.id),
+            "industry": client.industry, "base_currency": client.base_currency, "features": client.features,
+            "bank_accounts": [{"bank": bank.bank, "account_last4": bank.account_last4, "currency": bank.currency} for bank in banks]},
         "documents": list(files.values()), "requirements": [{"id": str(req.id), "document_type": req.type, "title": req.title, "analysis_type": req.analysis_type, "required": req.required, "instructions": str(req.criteria.get("description", ""))[:4000]} for req in requirements], "search_history": []}
     run.input_snapshot = {"request": payload, "turn_attempts": 0, "search_results": []}
     if len(files) > 100 or sum(sizes.values()) > 100 * 1024 * 1024:
