@@ -100,6 +100,7 @@ class ReviewSubmissionOut(BaseModel):
     id: UUID
     round_no: int
     note: str | None
+    manual_review_requested: bool
     submitted_at: datetime | None
 
 

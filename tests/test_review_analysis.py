@@ -149,6 +149,60 @@ def test_auto_review_returns_failed_item_to_client(records, monkeypatch):
             assert "INSUFFICIENT_EVIDENCE" in finding["manual_reasons"]
 
 
+def test_client_can_route_ai_dispute_to_accountant(records, monkeypatch):
+    monkeypatch.setattr(
+        "app.review_analysis.call_agent",
+        lambda body: automatic_response(body, records["required"], "REQUEST_ACTION"),
+    )
+    with TestClient(app) as client:
+        portal, staff = submitted(client, records)
+        assert process_review()
+
+        returned = client.get(
+            f"/api/v1/portal/collection-requests/{records['request']}",
+            headers=portal,
+        ).json()
+        assert returned["status"] == "CHANGES_REQUESTED"
+        assert returned["manual_review_available"] is True
+
+        resubmitted = client.post(
+            f"/api/v1/portal/collection-requests/{records['request']}/submit",
+            headers=portal,
+            json={
+                "note": "I disagree with the AI result; please review this manually.",
+                "manual_review_requested": True,
+            },
+        )
+        assert resubmitted.status_code == 200, resubmitted.text
+        assert resubmitted.json()["review_status"] == "AWAITING_ACCOUNTANT"
+        assert resubmitted.json()["submission"]["manual_review_requested"] is True
+        assert resubmitted.json()["manual_review_available"] is False
+        assert not process_review()
+
+        review = client.get(
+            f"/api/v1/collection-requests/{records['request']}/review",
+            headers=staff,
+        ).json()
+        assert review["review_status"] == "AWAITING_ACCOUNTANT"
+        assert review["submissions"][-1]["manual_review_requested"] is True
+
+        notification = client.get("/api/v1/notifications", headers=staff).json()["items"][0]
+        assert notification["event_type"] == "SUBMITTED"
+        assert notification["payload"]["manual_review_requested"] is True
+
+        with SessionLocal() as db:
+            runs = list(db.scalars(select(AIRun).where(AIRun.purpose == "REVIEW")))
+            assert len(runs) == 1
+            latest = db.scalar(select(Submission).order_by(Submission.round_no.desc()).limit(1))
+            assert latest.manual_review_requested is True
+            carried = list(db.scalars(select(RequirementDocument).where(
+                RequirementDocument.submission_id == latest.id,
+                RequirementDocument.requirement_id == records["required"],
+                RequirementDocument.excluded_at.is_(None),
+            )))
+            assert len(carried) == 1
+
+
 def test_auto_review_passes_items_but_waits_for_whole_request_confirmation(records, monkeypatch):
     with SessionLocal.begin() as db:
         db.delete(db.get(Requirement, records["optional"]))

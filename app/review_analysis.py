@@ -52,7 +52,7 @@ def collection_review_status(db, item, requirements=None, submission=None):
 
 
 def enqueue_review(db, item, submission, user_id):
-    if item.ai_mode == "OFF":
+    if item.ai_mode == "OFF" or submission.manual_review_requested:
         return None
     db.flush()
     requirements = list(db.scalars(select(Requirement).where(Requirement.request_id == item.id).order_by(Requirement.position)))

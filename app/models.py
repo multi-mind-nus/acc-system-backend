@@ -390,6 +390,9 @@ class Submission(Base):
     round_no: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), default="DRAFT")
     note: Mapped[str | None] = mapped_column(Text)
+    manual_review_requested: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

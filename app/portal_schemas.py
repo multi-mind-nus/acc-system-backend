@@ -32,11 +32,19 @@ class PortalRequirementOut(BaseModel):
     documents: list[PortalDocumentOut]
 
 
+class PortalWorkflowEventOut(BaseModel):
+    id: UUID
+    event_type: str
+    payload: dict
+    created_at: datetime
+
+
 class PortalSubmissionOut(BaseModel):
     id: UUID
     round_no: int
     status: Literal["DRAFT", "SUBMITTED"]
     note: str | None
+    manual_review_requested: bool
     submitted_at: datetime | None
     created_at: datetime
 
@@ -59,6 +67,8 @@ class PortalCollectionDetailOut(PortalCollectionSummaryOut):
     scope_note: str | None
     requirements: list[PortalRequirementOut]
     submission: PortalSubmissionOut | None
+    manual_review_available: bool
+    events: list[PortalWorkflowEventOut]
 
 
 class PortalCollectionListOut(BaseModel):
@@ -75,3 +85,4 @@ class PortalSubmitInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     note: str | None = Field(default=None, max_length=2000)
+    manual_review_requested: bool = False

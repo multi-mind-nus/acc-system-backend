@@ -23,8 +23,10 @@ from app.models import (
     Document,
     Requirement,
     RequirementDocument,
+    ReviewDecision,
     Submission,
     User,
+    WorkflowEvent,
 )
 from app.notifications import add_workflow_event
 from app.portal_schemas import (
@@ -36,6 +38,7 @@ from app.portal_schemas import (
     PortalSubmissionOut,
     PortalSubmitInput,
     PortalUploadOut,
+    PortalWorkflowEventOut,
 )
 from app.review_analysis import collection_review_status
 
@@ -47,6 +50,15 @@ ALLOWED_FILES = {
     ".png": ("image/png", b"\x89PNG\r\n\x1a\n"),
     ".jpg": ("image/jpeg", b"\xff\xd8\xff"),
     ".jpeg": ("image/jpeg", b"\xff\xd8\xff"),
+}
+PUBLIC_EVENT_TYPES = {
+    "PUBLISHED",
+    "SUBMITTED",
+    "AI_REVIEW_COMPLETED",
+    "CHANGES_REQUESTED",
+    "APPROVED",
+    "APPROVAL_WITHDRAWN",
+    "CANCELLED",
 }
 
 
@@ -75,6 +87,36 @@ def _submission(db, request_id: UUID, status: str | None = None) -> Submission |
     if status:
         statement = statement.where(Submission.status == status)
     return db.scalar(statement.order_by(Submission.round_no.desc()).limit(1))
+
+
+def _manual_review_available(db, item: CollectionRequest) -> bool:
+    submission = _submission(db, item.id, "SUBMITTED")
+    return bool(
+        item.status == "CHANGES_REQUESTED"
+        and submission
+        and db.scalar(select(ReviewDecision.id).where(
+            ReviewDecision.submission_id == submission.id,
+            ReviewDecision.source == "AI",
+            ReviewDecision.decision == "REQUEST_ACTION",
+        ).limit(1))
+    )
+
+
+def _public_events(db, request_id: UUID) -> list[PortalWorkflowEventOut]:
+    events = db.scalars(select(WorkflowEvent).where(
+        WorkflowEvent.request_id == request_id,
+        WorkflowEvent.event_type.in_(PUBLIC_EVENT_TYPES),
+    ).order_by(WorkflowEvent.created_at, WorkflowEvent.id)).all()
+    return [PortalWorkflowEventOut(
+        id=event.id,
+        event_type=event.event_type,
+        payload={
+            key: event.payload[key]
+            for key in ("round_no", "manual_review_requested")
+            if event.event_type == "SUBMITTED" and key in event.payload
+        },
+        created_at=event.created_at,
+    ) for event in events]
 
 
 def _draft_submission(db, item: CollectionRequest, principal: Principal) -> Submission:
@@ -155,10 +197,13 @@ def _requirement_editable(
     )
 
 
-def _carry_unreviewed_documents(db, item, draft, requirements):
+def _carry_unreviewed_documents(
+    db, item, draft, requirements, *, include_needs_action=False,
+):
     if item.status != "CHANGES_REQUESTED":
         return
-    carry_ids = {value.id for value in requirements if value.status in ("PENDING", "RECEIVED")}
+    statuses = ("PENDING", "RECEIVED", "NEEDS_ACTION") if include_needs_action else ("PENDING", "RECEIVED")
+    carry_ids = {value.id for value in requirements if value.status in statuses}
     current = {(link.requirement_id, document.id) for link, document in _links(db, draft.id) if not link.excluded_at}
     for link, document, submission in _effective_links(db, item.id):
         key = (link.requirement_id, document.id)
@@ -250,6 +295,8 @@ def _detail(db, item: CollectionRequest) -> PortalCollectionDetailOut:
             documents=by_requirement.get(None, []),
         )],
         submission=PortalSubmissionOut.model_validate(latest, from_attributes=True) if latest else None,
+        manual_review_available=_manual_review_available(db, item),
+        events=_public_events(db, item.id),
     )
 
 
@@ -573,7 +620,16 @@ def submit_collection(
     item = _load_request(db, principal, request_id, lock=True)
     if item.status not in ("OPEN", "CHANGES_REQUESTED"):
         raise APIError(409, "INVALID_TRANSITION", "This request cannot be submitted")
+    manual_review_requested = bool(body and body.manual_review_requested)
+    if manual_review_requested and not _manual_review_available(db, item):
+        raise APIError(
+            409,
+            "MANUAL_REVIEW_NOT_AVAILABLE",
+            "Manual review can only be requested for an AI review result",
+        )
     draft = _submission(db, item.id, "DRAFT")
+    if draft is None and manual_review_requested:
+        draft = _draft_submission(db, item, principal)
     if draft is None:
         raise APIError(422, "REQUIRED_DOCUMENTS_MISSING", "Upload the required documents")
     requirements = list(db.scalars(
@@ -581,7 +637,13 @@ def submit_collection(
             Requirement.request_id == item.id,
         )
     ))
-    _carry_unreviewed_documents(db, item, draft, requirements)
+    _carry_unreviewed_documents(
+        db,
+        item,
+        draft,
+        requirements,
+        include_needs_action=manual_review_requested,
+    )
     rows = _links(db, draft.id)
     active = [(link, document) for link, document in rows if not link.excluded_at]
     if any(document.status == "QUARANTINED" for _, document in active):
@@ -602,6 +664,7 @@ def submit_collection(
     now = datetime.now(UTC)
     draft.status = "SUBMITTED"
     draft.note = body.note or None if body else None
+    draft.manual_review_requested = manual_review_requested
     draft.submitted_at = now
     for requirement in requirements:
         if (
@@ -619,7 +682,9 @@ def submit_collection(
         item,
         "SUBMITTED",
         actor_id=principal.user.id,
-        payload={"round_no": draft.round_no},
+        payload={"round_no": draft.round_no} | (
+            {"manual_review_requested": True} if manual_review_requested else {}
+        ),
         created_at=now,
     )
     db.commit()

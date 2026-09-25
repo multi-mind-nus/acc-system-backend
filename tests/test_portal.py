@@ -20,6 +20,7 @@ from app.models import (
     Requirement,
     ReviewDecision,
     User,
+    WorkflowEvent,
 )
 from app.worker import _scan_file, process_next_document
 
@@ -143,6 +144,34 @@ def test_upload_scan_duplicate_exclude_and_submit(records, monkeypatch):
         assert "updated_at" in listed.json()["items"][0]
 
         with SessionLocal.begin() as db:
+            request = db.get(CollectionRequest, records["request"])
+            db.add_all([
+                WorkflowEvent(
+                    firm_id=request.firm_id,
+                    request_id=request.id,
+                    actor_id=records["admin"],
+                    event_type="PUBLISHED",
+                    payload={"internal": "must not leak"},
+                ),
+                WorkflowEvent(
+                    firm_id=request.firm_id,
+                    request_id=request.id,
+                    actor_id=records["admin"],
+                    event_type="REQUIREMENT_REVIEWED",
+                    payload={"internal_note": "private"},
+                ),
+            ])
+        public_detail = client.get(
+            f"/api/v1/portal/collection-requests/{records['request']}",
+            headers=headers,
+        )
+        assert public_detail.status_code == 200
+        assert [event["event_type"] for event in public_detail.json()["events"]] == ["PUBLISHED"]
+        assert public_detail.json()["events"][0]["payload"] == {}
+        assert "must not leak" not in public_detail.text
+        assert "private" not in public_detail.text
+
+        with SessionLocal.begin() as db:
             original = db.get(CollectionRequest, records["request"])
             original.updated_at = datetime(2026, 11, 2, tzinfo=UTC)
             older = CollectionRequest(
@@ -201,6 +230,13 @@ def test_upload_scan_duplicate_exclude_and_submit(records, monkeypatch):
         excluded = client.delete(f"/api/v1/portal/document-links/{optional_link_id}", headers=headers)
         assert excluded.status_code == 200
         # The latest link is excluded; the required link remains valid.
+        unavailable = client.post(
+            f"/api/v1/portal/collection-requests/{records['request']}/submit",
+            headers=headers,
+            json={"manual_review_requested": True},
+        )
+        assert unavailable.status_code == 409
+        assert unavailable.json()["code"] == "MANUAL_REVIEW_NOT_AVAILABLE"
         submitted = client.post(
             f"/api/v1/portal/collection-requests/{records['request']}/submit",
             headers=headers,
@@ -212,6 +248,8 @@ def test_upload_scan_duplicate_exclude_and_submit(records, monkeypatch):
         assert submitted.json()["submission"]["note"] == (
             "Bank statement uploaded; receipts will follow if needed."
         )
+        assert submitted.json()["events"][-1]["event_type"] == "SUBMITTED"
+        assert submitted.json()["events"][-1]["payload"] == {"round_no": 1}
         assert submitted.json()["requirements"][0]["documents"][0]["editable"] is False
         assert client.delete(
             f"/api/v1/portal/document-links/{optional_link_id}", headers=headers
