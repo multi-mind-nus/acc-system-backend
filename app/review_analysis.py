@@ -13,8 +13,9 @@ from app.db import SessionLocal
 from app.models import (
     AIRun, Client, ClientMember, CollectionRequest, Document, NotificationOutbox,
     Requirement, RequirementDocument, ReviewDecision, ReviewDecisionDocument,
-    Submission, User, WorkflowEvent,
+    Submission, User,
 )
+from app.notifications import add_workflow_event
 
 
 def file_reference(doc, requirement_ids=(), scope="CURRENT"):
@@ -235,12 +236,14 @@ def process_review():
                 db.add_all(ReviewDecisionDocument(
                     decision_id=decision.id, document_id=value.document_id, relation=value.relation,
                 ) for value in finding.evidence)
-                db.add(WorkflowEvent(
-                    firm_id=item.firm_id, request_id=item.id, actor_id=None,
-                    actor_type="SYSTEM", event_type="AI_REQUIREMENT_REVIEWED",
+                add_workflow_event(
+                    db,
+                    item,
+                    "AI_REQUIREMENT_REVIEWED",
+                    actor_id=None,
                     payload={"requirement_id": str(requirement.id), "decision": finding.suggested_decision, "ai_run_id": str(run.id)},
                     created_at=now,
-                ))
+                )
                 item.updated_at = now
                 if finding.suggested_decision != "REQUEST_ACTION":
                     continue
@@ -263,12 +266,33 @@ def process_review():
                     ))
             if auto_returned:
                 item.status = "CHANGES_REQUESTED"
-                db.add(WorkflowEvent(
-                    firm_id=item.firm_id, request_id=item.id, actor_id=None,
-                    actor_type="SYSTEM", event_type="CHANGES_REQUESTED",
+                add_workflow_event(
+                    db,
+                    item,
+                    "CHANGES_REQUESTED",
+                    actor_id=None,
                     payload={"reason": "\n".join(value.client_message for value in auto_returned)},
-                    created_at=datetime.now(UTC),
-                ))
+                )
+            elif (
+                item.ai_mode == "AUTO_REVIEW"
+                and output["findings"]
+                and all(
+                    finding["suggested_decision"] == "SATISFY"
+                    and not finding["manual_reasons"]
+                    for finding in output["findings"]
+                )
+                and all(
+                    requirement.status in ("SATISFIED", "WAIVED")
+                    for requirement in requirements.values()
+                )
+            ):
+                add_workflow_event(
+                    db,
+                    item,
+                    "AI_REVIEW_COMPLETED",
+                    actor_id=None,
+                    payload={"ai_run_id": str(run.id)},
+                )
             run.output, run.model_version, run.status, run.error = output, result.model_version, "SUCCEEDED", None
             for extraction in result.extractions:
                 doc = docs[extraction.document_id]

@@ -39,6 +39,7 @@ from app.models import (
     User,
     WorkflowEvent,
 )
+from app.notifications import add_workflow_event
 from app.review_analysis import collection_review_status
 
 router = APIRouter(prefix="/api/v1/collection-requests")
@@ -53,20 +54,21 @@ IdempotencyKey = Annotated[
 
 def _event(
     db, principal: Principal, request_id: UUID, event_type: str,
-    payload: dict | None = None,
+    payload: dict | None = None, *, notify: bool = True,
 ) -> None:
     now = datetime.now(UTC)
     db.execute(update(CollectionRequest).where(
         CollectionRequest.id == request_id,
     ).values(updated_at=now))
-    db.add(WorkflowEvent(
-        firm_id=principal.firm.id,
-        request_id=request_id,
+    add_workflow_event(
+        db,
+        db.get(CollectionRequest, request_id),
+        event_type,
         actor_id=principal.user.id,
-        event_type=event_type,
-        payload=payload or {},
+        payload=payload,
         created_at=now,
-    ))
+        notify=notify,
+    )
 
 
 def _requirements(db, request_id: UUID) -> list[Requirement]:
@@ -463,8 +465,16 @@ def cancel_collection(
         raise APIError(409, "VERSION_CONFLICT", "Request has changed", _detail(db, item))
     if item.status not in ("DRAFT", "OPEN", "IN_REVIEW", "CHANGES_REQUESTED"):
         raise APIError(409, "INVALID_TRANSITION", "Request cannot be cancelled")
+    notify = item.status != "DRAFT"
     item.status = "CANCELLED"
-    _event(db, principal, item.id, "CANCELLED", {"reason": body.reason})
+    _event(
+        db,
+        principal,
+        item.id,
+        "CANCELLED",
+        {"reason": body.reason},
+        notify=notify,
+    )
     db.flush()
     result = _detail(db, item)
     _complete_idempotent(record, result)

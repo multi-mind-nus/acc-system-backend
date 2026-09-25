@@ -25,8 +25,8 @@ from app.models import (
     RequirementDocument,
     Submission,
     User,
-    WorkflowEvent,
 )
+from app.notifications import add_workflow_event
 from app.portal_schemas import (
     PortalCollectionDetailOut,
     PortalCollectionListOut,
@@ -614,13 +614,13 @@ def submit_collection(
     item.updated_at = now
     from app.review_analysis import enqueue_review
     enqueue_review(db, item, draft, principal.user.id)
-    db.add(WorkflowEvent(
-        firm_id=item.firm_id,
-        request_id=item.id,
+    add_workflow_event(
+        db,
+        item,
+        "SUBMITTED",
         actor_id=principal.user.id,
-        event_type="SUBMITTED",
         payload={"round_no": draft.round_no},
         created_at=now,
-    ))
+    )
     db.commit()
     return _detail(db, item)

@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.analysis_schemas import AmountRelation
 from app.db import SessionLocal
 from app.main import app
-from app.models import AIRun, Client, CollectionRequest, Document, Firm, FirmMember, NotificationOutbox, Requirement, RequirementDocument, ReviewDecision, Submission, User, WorkflowEvent
+from app.models import AIRun, Client, CollectionRequest, Document, Firm, FirmMember, Notification, NotificationOutbox, Requirement, RequirementDocument, ReviewDecision, Submission, User, WorkflowEvent
 from app.review_analysis import amount_valid, authorized_documents, process_review
 from app.worker import process_next_document
 from test_portal import clean_state, records, auth_headers, upload  # noqa: F401
@@ -92,6 +92,7 @@ def test_auto_review_returns_failed_item_to_client(records, monkeypatch):
         with SessionLocal() as db:
             assert len(list(db.scalars(select(ReviewDecision)))) == 1
             assert len(list(db.scalars(select(WorkflowEvent).where(WorkflowEvent.event_type == "AI_REQUIREMENT_REVIEWED")))) == 1
+            assert db.scalar(select(Notification)) is not None
             notice = db.scalar(select(NotificationOutbox))
             assert notice.status == "SUPPRESSED" and notice.last_error == "PROVIDER_DISABLED"
         assert upload(client, portal, records["request"], records["required"], b"%PDF-1.7\ncorrected").status_code == 202
@@ -114,6 +115,11 @@ def test_auto_review_passes_items_but_waits_for_whole_request_confirmation(recor
             assert db.get(CollectionRequest, records["request"]).status == "IN_REVIEW"
             assert db.get(Requirement, records["required"]).status == "SATISFIED"
             assert db.scalar(select(ReviewDecision)).source == "AI"
+            assert db.scalar(
+                select(Notification)
+                .join(WorkflowEvent, WorkflowEvent.id == Notification.event_id)
+                .where(WorkflowEvent.event_type == "AI_REVIEW_COMPLETED")
+            ) is not None
         public = client.get(f"/api/v1/portal/collection-requests/{records['request']}", headers=portal).json()
         assert public["status"] == "IN_REVIEW" and public["review_status"] == "AI_PASSED"
         summary = next(value for value in client.get("/api/v1/collection-requests", headers=staff).json()["items"] if value["id"] == str(records["request"]))

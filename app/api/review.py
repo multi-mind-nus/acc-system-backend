@@ -29,7 +29,6 @@ from app.models import (
     ReviewDecisionDocument,
     Submission,
     User,
-    WorkflowEvent,
 )
 from app.review_schemas import (
     ReviewRunOut,
@@ -43,6 +42,7 @@ from app.review_schemas import (
     ReviewSubmissionOut,
     TransitionInput,
 )
+from app.notifications import add_workflow_event
 
 router = APIRouter(prefix="/api/v1")
 Staff = Annotated[
@@ -96,14 +96,14 @@ def _event(db, principal: Principal, item: CollectionRequest, kind: str, payload
     db.execute(update(CollectionRequest).where(
         CollectionRequest.id == item.id,
     ).values(updated_at=now))
-    db.add(WorkflowEvent(
-        firm_id=item.firm_id,
-        request_id=item.id,
+    add_workflow_event(
+        db,
+        item,
+        kind,
         actor_id=principal.user.id,
-        event_type=kind,
-        payload=payload or {},
+        payload=payload,
         created_at=now,
-    ))
+    )
 
 
 def _document_out(link, document, submission) -> ReviewDocumentOut:

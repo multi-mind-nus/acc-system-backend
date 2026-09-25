@@ -325,6 +325,7 @@ class WorkflowEvent(Base):
             ["firm_id", "request_id"],
             ["collection_requests.firm_id", "collection_requests.id"],
         ),
+        UniqueConstraint("firm_id", "id"),
         Index("ix_workflow_events_request_created", "request_id", "created_at"),
     )
 
@@ -565,3 +566,25 @@ class NotificationOutbox(Base):
     last_error: Mapped[str] = mapped_column(String(64), default="PROVIDER_DISABLED", server_default="PROVIDER_DISABLED")
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    __table_args__ = (
+        ForeignKeyConstraint(["firm_id", "user_id"], ["users.firm_id", "users.id"]),
+        ForeignKeyConstraint(
+            ["firm_id", "event_id"],
+            ["workflow_events.firm_id", "workflow_events.id"],
+        ),
+        UniqueConstraint("user_id", "event_id", name="uq_notifications_user_event"),
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    firm_id: Mapped[UUID] = mapped_column(ForeignKey("firms.id"))
+    user_id: Mapped[UUID]
+    event_id: Mapped[UUID]
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
