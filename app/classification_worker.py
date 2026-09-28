@@ -4,6 +4,8 @@ from uuid import UUID, uuid4
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from app.agent_errors import agent_http_error
+
 from pydantic import ValidationError
 from sqlalchemy import or_, select
 
@@ -59,7 +61,7 @@ def process_classification() -> bool:
         by_id = {item["document_id"]: item for item in result["classifications"] + invalid}
         result["classifications"] = [by_id[str(id)] for id in ids]
     except HTTPError as exc:
-        error = "AGENT_UNAVAILABLE" if exc.code >= 500 else "AGENT_INVALID_RESPONSE"
+        error = agent_http_error(exc)
     except (URLError, TimeoutError, OSError):
         error = "AGENT_UNAVAILABLE"
     except (ValueError, ValidationError):

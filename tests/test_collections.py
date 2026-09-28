@@ -356,7 +356,7 @@ def test_ai_policy_defaults_validation_copy_and_draft_guard(records):
         published = client.post(path + "/publish", headers=idempotent(headers, "ai-publish"), json={"version": updated["version"]})
         assert published.status_code == 200, published.text
         assert client.patch(path, headers=headers, json={"version": published.json()["version"], "ai_mode": "OFF"}).status_code == 409
-        # Analysis is internal: a bank statement needs no manually entered transaction.
+        # Bank statements still default to reconciliation without a manually entered transaction.
         body["period"] = "2026-11-01"
         body["requirements"][0]["type"] = "BANK_STATEMENT"
         result = client.post("/api/v1/collection-requests", headers=idempotent(headers, "automatic-analysis"), json=body)
@@ -379,13 +379,28 @@ def test_ai_policy_defaults_validation_copy_and_draft_guard(records):
         copied_draft = client.post(draft_path + "/copy", params={"period": "2026-12-01"}, headers=idempotent(headers, "copy-internal-analysis"))
         assert copied_draft.status_code == 201, copied_draft.text
         copied_bank = next(req for req in copied_draft.json()["requirements"] if req["title"] == "Bank statement")
-        assert copied_bank["analysis_type"] == "BANK_TRANSACTION_RECONCILIATION"
+        assert copied_bank["analysis_type"] == "DOCUMENT_REQUIREMENT_VALIDATION"
         assert copied_bank["criteria"] == {"period_note": "Keep this instruction"}
         with SessionLocal() as db:
             assert db.get(Requirement, UUID(added.json()["id"])).criteria["target_transaction"] == legacy_target
         body["period"] = "2026-12-01"
         body["requirements"][0]["analysis_type"] = "DOCUMENT_REQUIREMENT_VALIDATION"
-        assert client.post("/api/v1/collection-requests", headers=idempotent(headers, "client-analysis-override"), json=body).status_code == 422
+        explicit = client.post("/api/v1/collection-requests", headers=idempotent(headers, "client-analysis-override"), json=body)
+        assert explicit.status_code == 201, explicit.text
+        validation = explicit.json()["requirements"][0]
+        assert validation["analysis_type"] == "DOCUMENT_REQUIREMENT_VALIDATION"
+        edited = client.patch(f"/api/v1/requirements/{validation['id']}", headers=headers, json={
+            "version": validation["version"], "type": "BANK_STATEMENT", "title": "Holder and month",
+        })
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["analysis_type"] == "DOCUMENT_REQUIREMENT_VALIDATION"
+        added = client.post(draft_path + "/requirements", headers=headers, json={
+            "type": "BANK_STATEMENT", "title": "Holder and month", "analysis_type": "DOCUMENT_REQUIREMENT_VALIDATION",
+        })
+        assert added.status_code == 201, added.text
+        assert added.json()["analysis_type"] == "DOCUMENT_REQUIREMENT_VALIDATION"
+        body["requirements"][0]["analysis_type"] = "UNKNOWN"
+        assert client.post("/api/v1/collection-requests", headers=idempotent(headers, "invalid-analysis"), json=body).status_code == 422
         with SessionLocal() as db:
             assert db.scalar(select(func.count(AIRun.id))) == 0
             assert db.scalar(select(func.count(NotificationOutbox.id))) == 0

@@ -30,6 +30,7 @@ class RequirementInput(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     required: bool = True
     criteria: dict = Field(default_factory=dict)
+    analysis_type: AnalysisType | None = None
 
 
 class RequirementUpdate(RequirementInput):

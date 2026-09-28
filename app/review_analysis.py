@@ -5,6 +5,8 @@ from uuid import UUID, uuid4
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from app.agent_errors import agent_http_error
+
 from sqlalchemy import or_, select
 
 from app.analysis_schemas import ReviewRequest, validate_review
@@ -178,7 +180,7 @@ def process_review():
         body = ReviewRequest.model_validate(snapshot["request"])
         result = validate_review(body, call_agent(body))
     except HTTPError as exc:
-        error = "AGENT_UNAVAILABLE" if exc.code >= 500 else "AGENT_INVALID_RESPONSE"
+        error = agent_http_error(exc)
     except (URLError, TimeoutError, OSError):
         error = "AGENT_UNAVAILABLE"
     except ValueError:

@@ -379,7 +379,7 @@ def create_collection(
         request_id=item.id,
         position=position,
         type=requirement.type,
-        analysis_type=default_analysis_type(requirement.type),
+        analysis_type=requirement.analysis_type or default_analysis_type(requirement.type),
         title=requirement.title,
         required=requirement.required,
         criteria=requirement.criteria,
@@ -533,7 +533,7 @@ def copy_collection(
         request_id=item.id,
         position=requirement.position,
         type=requirement.type,
-        analysis_type=default_analysis_type(requirement.type),
+        analysis_type=requirement.analysis_type,
         title=requirement.title,
         required=requirement.required,
         criteria={key: value for key, value in requirement.criteria.items() if key != "target_transaction"},
@@ -558,11 +558,11 @@ def add_requirement(
         firm_id=principal.firm.id,
         request_id=item.id,
         origin="FOLLOW_UP" if follow_up else "INITIAL",
-        analysis_type=default_analysis_type(body.type),
+        analysis_type=body.analysis_type or default_analysis_type(body.type),
         position=db.scalar(select(func.coalesce(func.max(Requirement.position), -1)).where(
             Requirement.request_id == item.id
         )) + 1,
-        **body.model_dump(),
+        **body.model_dump(exclude={"analysis_type"}),
     )
     db.add(requirement)
     if follow_up:
@@ -604,9 +604,12 @@ def update_requirement(
         raise APIError(409, "COLLECTION_NOT_EDITABLE", "Published requirements cannot be changed")
     if requirement.version != body.version:
         raise APIError(409, "VERSION_CONFLICT", "Requirement has changed")
-    for field, value in body.model_dump(exclude={"version"}).items():
+    analysis_type = body.analysis_type or (
+        requirement.analysis_type if requirement.type == body.type else default_analysis_type(body.type)
+    )
+    for field, value in body.model_dump(exclude={"version", "analysis_type"}).items():
         setattr(requirement, field, value)
-    requirement.analysis_type = default_analysis_type(body.type)
+    requirement.analysis_type = analysis_type
     _event(db, principal, item.id, "REQUIREMENT_UPDATED", {"requirement_id": str(requirement.id)})
     db.commit()
     return requirement
